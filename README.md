@@ -13,7 +13,7 @@ distill mcp add mac-use -- /path/to/mac-use/.build/release/mac-use-mcp
 distill mcp doctor mac-use
 ```
 
-Use the absolute path to your checkout in place of `/path/to/mac-use`. Grant **Accessibility** and **Screen Recording** to the app that launched Distill if macOS requests them. `doctor` reports missing permissions instead of silently skipping them. The server never asks for an administrator password. A missing TypeSafe key (`JEV_API_KEY` or `TYPESAFE_API_KEY`) makes `jev_decide` return an error without proposing an action; observation and native tools remain available. Jev requests use TypeSafe's typed `POST /v1/systemone` API (`jev-latest`). The Jev model configured as a *Distill model tier* is a different feature; the MCP server cannot call Distill's private Rust Jev client.
+Use the absolute path to your checkout in place of `/path/to/mac-use`. Grant **Accessibility** and **Screen Recording** to the app that launched Distill if macOS requests them. `distill mcp doctor mac-use` checks server startup; the MCP's `doctor` tool reports native permission status for an exact target window. The server never asks for an administrator password. A missing TypeSafe key (`JEV_API_KEY` or `TYPESAFE_API_KEY`) makes `jev_decide` return an error without proposing an action; observation and native tools remain available. Jev requests use TypeSafe's typed `POST /v1/systemone` API (`jev-latest`). The Jev model configured as a *Distill model tier* is a different feature; the MCP server cannot call Distill's private Rust Jev client.
 
 ## Usage
 
