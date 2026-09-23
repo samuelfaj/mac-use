@@ -125,15 +125,20 @@ public struct ManagedComputerUseMCP: Sendable {
     private let queue: ComputerUseHostQueue
     private let backend: any ComputerUseToolBackend
     private let jev: JevDecision
+    private let jevAvailable: @Sendable () -> Bool
 
     public init(
         queue: ComputerUseHostQueue = .shared,
         backend: any ComputerUseToolBackend = ComputerUseNativeHostBackend(),
-        jev: JevDecision = JevDecision()
+        jev: JevDecision = JevDecision(),
+        jevAvailable: @escaping @Sendable () -> Bool = {
+            TypeSafeJevTransport.isConfigured()
+        }
     ) {
         self.queue = queue
         self.backend = backend
         self.jev = jev
+        self.jevAvailable = jevAvailable
     }
 
     public func handle(_ line: String) async -> String? {
@@ -154,7 +159,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one Jev-guided semantic step (requires JEV_API_KEY or TYPESAFE_API_KEY); it returns a proposal and fresh state token but does not act. Call click_element with the exact role, label, target and token only when authorized. Reobserve after every mutation. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -178,8 +183,13 @@ public struct ManagedComputerUseMCP: Sendable {
                     guard !observation.isError, let text = observation.content.first?.text else {
                         return reply(id: id, result: ["content": observation.jsonContent(), "isError": true])
                     }
-                    let proposal = try await jev.advise(goal: goal, observation: text)
-                    var output = proposal.jsonObject()
+                    let outputFromModel: [String: Any]
+                    if jevAvailable() {
+                        outputFromModel = try await jev.advise(goal: goal, observation: text).jsonObject()
+                    } else {
+                        outputFromModel = try jev.localFallback(observation: text)
+                    }
+                    var output = outputFromModel
                     if let prefix = text.range(of: "\nui_tree: "),
                        let header = text[..<prefix.lowerBound].data(using: .utf8),
                        let status = try? JSONSerialization.jsonObject(with: header) as? [String: Any],
@@ -238,7 +248,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "get_ui_tree":
             return "Accessibility tree for a window. Contains private screen text; use jev_decide for redacted Jev guidance."
         case "jev_decide":
-            return "Ask Jev to choose one safe next semantic action, WAIT, DONE or BLOCKED from an exact window's current Accessibility tree. No input is posted. Returns a state token for subsequent native validation. Only redacted labels and goal text leave this Mac."
+            return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED. Without a key, return unambiguous labeled candidates for the Distill session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "click_element":
             return "Press an AX element by role and label in the exact background target."
         case "doctor":

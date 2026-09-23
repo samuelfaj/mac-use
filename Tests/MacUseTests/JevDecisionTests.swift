@@ -2,6 +2,20 @@ import Foundation
 import XCTest
 @testable import MacUse
 
+private final class StubHTTPProtocol: URLProtocol {
+    static var inspect: ((URLRequest) -> Void)?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.inspect?(request)
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"answers":{}}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
 private actor TestJev: JevTransport {
     var captured: [String: Any]?
     let selected: String
@@ -40,6 +54,12 @@ private actor TestJev: JevTransport {
     func request() -> [String: Any]? { captured }
 }
 
+private struct FailingJev: JevTransport {
+    func evaluate(_ request: [String: Any]) async throws -> [String: Any] {
+        throw JevDecisionError.unavailable("Jev provider unavailable")
+    }
+}
+
 private struct ObservationBackend: ComputerUseToolBackend {
     let observation: String
     func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
@@ -53,6 +73,49 @@ final class JevDecisionTests: XCTestCase {
     {"user_activity":"none","is_on_screen":true,"is_minimized":false,"permissions":{"accessibility":true},"state_token":"private-token","target_pid":123}
     ui_tree: {"role":"AXWindow","value":"private message","children":[{"role":"AXButton","title":"Send"},{"role":"AXTextField","value":"secret text"}]}
     """
+
+    func testJevCredentialsSelectCorrectTypedProviderAndModel() throws {
+        XCTAssertNil(TypeSafeJevTransport.route(environment: [:]))
+        let openRouter = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key"]))
+        XCTAssertEqual(openRouter.url.absoluteString, "https://openrouter.ai/api/alpha/decisions")
+        XCTAssertEqual(openRouter.model, "typesafe/jev-1.13")
+        XCTAssertEqual(openRouter.key, "or-key")
+        let direct = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "ts-key"]))
+        XCTAssertEqual(direct.url.absoluteString, "https://api.typesafe.ai/v1/systemone")
+        XCTAssertEqual(direct.model, "jev-latest")
+        XCTAssertEqual(direct.key, "ts-key")
+        XCTAssertEqual(TypeSafeJevTransport.route(environment: ["JEV_API_KEY": "jev-key", "TYPESAFE_API_KEY": "ts-key"])?.key, "jev-key")
+    }
+
+    func testOpenRouterTransportPostsTypedDecisionEnvelopeWithoutLeakingOtherKey() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubHTTPProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel(); StubHTTPProtocol.inspect = nil }
+        let requested = expectation(description: "OpenRouter typed Jev request")
+        StubHTTPProtocol.inspect = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://openrouter.ai/api/alpha/decisions")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer or-test")
+            var data = request.httpBody ?? Data()
+            if data.isEmpty, let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    data.append(contentsOf: buffer.prefix(count))
+                }
+            }
+            let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            XCTAssertEqual(body?["model"] as? String, "typesafe/jev-1.13")
+            XCTAssertEqual((body?["state"] as? [String: String])?["goal"], "Click Save")
+            requested.fulfill()
+        }
+        _ = try await TypeSafeJevTransport(environment: ["OPENROUTER_API_KEY": "or-test"], session: session)
+            .evaluate(["model": "jev-latest", "state": ["goal": "Click Save"], "questions": [:]])
+        await fulfillment(of: [requested], timeout: 2)
+    }
 
     func testJevOnlyReceivesAllowlistedLabelsNeverWindowTokenOrFieldValues() async throws {
         let transport = TestJev()
@@ -119,7 +182,8 @@ final class JevDecisionTests: XCTestCase {
         let handler = ManagedComputerUseMCP(
             queue: ComputerUseHostQueue(lockURL: lock),
             backend: ObservationBackend(observation: observation),
-            jev: JevDecision(transport: TestJev())
+            jev: JevDecision(transport: TestJev()),
+            jevAvailable: { true }
         )
         let call = #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
         let reply = await handler.handle(call)
@@ -131,6 +195,57 @@ final class JevDecisionTests: XCTestCase {
         let proposal = try XCTUnwrap(JSONSerialization.jsonObject(with: Data((parts[0]["text"] as! String).utf8)) as? [String: Any])
         XCTAssertEqual(proposal["operation"] as? String, "click_element")
         XCTAssertEqual(proposal["expected_state_token"] as? String, "private-token")
+    }
+
+    func testMissingJevKeyDefersToDistillLLMWithoutCallingJevOrExecutingInput() async throws {
+        let lock = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-tests-\(UUID().uuidString)/computer-use.lock")
+        let transport = TestJev()
+        let handler = ManagedComputerUseMCP(
+            queue: ComputerUseHostQueue(lockURL: lock),
+            backend: ObservationBackend(observation: observation),
+            jev: JevDecision(transport: transport),
+            jevAvailable: { false }
+        )
+        let call = #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
+        let reply = await handler.handle(call)
+        let response = try XCTUnwrap(reply)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
+        let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        let parts = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(parts.first?["text"] as? String)
+        let fallback = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        XCTAssertEqual(fallback["mode"] as? String, "llm")
+        XCTAssertEqual(fallback["operation"] as? String, "DEFER_TO_LLM")
+        XCTAssertEqual(fallback["expected_state_token"] as? String, "private-token")
+        XCTAssertEqual((fallback["candidates"] as? [[String: String]])?.first?["label"], "Send")
+        XCTAssertFalse(text.contains("private message"))
+        XCTAssertFalse(text.contains("secret text"))
+        let captured = await transport.request()
+        XCTAssertNil(captured)
+    }
+
+    func testConfiguredJevFailureDoesNotSilentlySwitchToLLM() async throws {
+        let lock = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-tests-\(UUID().uuidString)/computer-use.lock")
+        let handler = ManagedComputerUseMCP(
+            queue: ComputerUseHostQueue(lockURL: lock),
+            backend: ObservationBackend(observation: observation),
+            jev: JevDecision(transport: FailingJev()),
+            jevAvailable: { true }
+        )
+        let call = #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
+        let reply = await handler.handle(call)
+        let response = try XCTUnwrap(reply)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
+        let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, true)
+        let parts = try XCTUnwrap(result["content"] as? [[String: Any]])
+        XCTAssertFalse((parts.first?["text"] as? String ?? "").contains("DEFER_TO_LLM"))
+    }
+
+    func testMissingKeyWithHumanActivityDoesNotOfferLLMCandidates() async throws {
+        let unsafe = observation.replacingOccurrences(of: "\"none\"", with: "\"human\"")
+        XCTAssertThrowsError(try JevDecision(transport: TestJev()).localFallback(observation: unsafe))
     }
 
     func testTitleCannotResolveToAnotherButtonsDescription() async throws {

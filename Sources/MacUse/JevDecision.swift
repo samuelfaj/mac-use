@@ -8,22 +8,49 @@ public protocol JevTransport: Sendable {
 }
 
 public struct TypeSafeJevTransport: JevTransport {
-    public init() {}
+    struct Route {
+        let key: String
+        let url: URL
+        let model: String
+    }
+
+    static func route(environment: [String: String]) -> Route? {
+        if let key = [environment["JEV_API_KEY"], environment["TYPESAFE_API_KEY"]]
+            .compactMap({ $0 }).first(where: { !$0.isEmpty }) {
+            return Route(key: key, url: URL(string: "https://api.typesafe.ai/v1/systemone")!, model: "jev-latest")
+        }
+        if let key = environment["OPENROUTER_API_KEY"], !key.isEmpty {
+            return Route(key: key, url: URL(string: "https://openrouter.ai/api/alpha/decisions")!, model: "typesafe/jev-1.13")
+        }
+        return nil
+    }
+
+    public static func isConfigured(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        route(environment: environment) != nil
+    }
+
+    private let environment: [String: String]
+    private let session: URLSession
+
+    public init(environment: [String: String] = ProcessInfo.processInfo.environment, session: URLSession = .shared) {
+        self.environment = environment
+        self.session = session
+    }
 
     public func evaluate(_ request: [String: Any]) async throws -> [String: Any] {
-        let environment = ProcessInfo.processInfo.environment
-        guard let key = [environment["JEV_API_KEY"], environment["TYPESAFE_API_KEY"]]
-            .compactMap({ $0 }).first(where: { !$0.isEmpty }) else {
-            throw JevDecisionError.unavailable("Set JEV_API_KEY or TYPESAFE_API_KEY in the MCP server environment")
+        guard let route = Self.route(environment: environment) else {
+            throw JevDecisionError.unavailable("No Jev credential is available")
         }
-        let body = try JSONSerialization.data(withJSONObject: request)
-        var http = URLRequest(url: URL(string: "https://api.typesafe.ai/v1/systemone")!)
+        var payload = request
+        payload["model"] = route.model
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        var http = URLRequest(url: route.url)
         http.httpMethod = "POST"
-        http.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        http.setValue("Bearer \(route.key)", forHTTPHeaderField: "Authorization")
         http.setValue("application/json", forHTTPHeaderField: "Content-Type")
         http.httpBody = body
         http.timeoutInterval = 12
-        let (data, response) = try await URLSession.shared.data(for: http)
+        let (data, response) = try await session.data(for: http)
         guard let status = response as? HTTPURLResponse, status.statusCode == 200,
               data.count <= 1_000_000,
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -172,6 +199,36 @@ public struct JevDecision: Sendable {
             return Proposal(operation: "BLOCKED", role: nil, label: nil, probability: probability, confidence: confidence)
         }
         return Proposal(operation: "click_element", role: target.role, label: target.label, probability: probability, confidence: confidence)
+    }
+
+    public func localFallback(observation: String) throws -> [String: Any] {
+        guard let marker = observation.range(of: "\nui_tree: "),
+              let header = observation[..<marker.lowerBound].data(using: .utf8),
+              let status = try? JSONSerialization.jsonObject(with: header) as? [String: Any],
+              status["user_activity"] as? String == "none",
+              status["is_on_screen"] as? Bool == true,
+              status["is_minimized"] as? Bool == false,
+              (status["permissions"] as? [String: Bool])?["accessibility"] == true,
+              let treeData = observation[marker.upperBound...].data(using: .utf8),
+              let tree = try? JSONSerialization.jsonObject(with: treeData) as? [String: Any] else {
+            throw JevDecisionError.invalidObservation
+        }
+        var elements: [Element] = []
+        collect(tree, into: &elements)
+        let counts = Dictionary(elements.flatMap { element in
+            element.aliases.map { ("\(element.role):\($0)", 1) }
+        }, uniquingKeysWith: +)
+        let candidates = elements.filter { element in
+            !element.label.isEmpty && element.label.count <= 100 && scrub(element.label) == element.label
+                && counts["\(element.role):\(element.label)"] == 1
+        }.prefix(100).map { ["role": $0.role, "label": $0.label] }
+        return [
+            "mode": "llm",
+            "operation": "DEFER_TO_LLM",
+            "reason": "No Jev API key; Jev was not called",
+            "candidates": candidates,
+            "instructions": "The Distill session model must decide using the user's goal and current evidence. Do not infer success or authorization from this response. Act only on an unambiguous listed candidate with explicit user authorization for consequential actions; pass the exact window and state token to the native tool, then observe again. Never guess coordinates.",
+        ]
     }
 
     private func collect(_ node: [String: Any], into elements: inout [Element]) {
