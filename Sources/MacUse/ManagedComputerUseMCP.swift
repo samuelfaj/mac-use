@@ -119,18 +119,20 @@ public struct ManagedComputerUseMCP: Sendable {
     ]
 
     public static var advertisedToolNames: [String] {
-        observationTools + mutationTools
+        observationTools + mutationTools + ChromeProfileComputerUseBackend.tools
     }
 
     private let queue: ComputerUseHostQueue
     private let backend: any ComputerUseToolBackend
     private let jev: JevDecision
+    private let browser: any ComputerUseToolBackend
     private let jevAvailable: @Sendable () -> Bool
 
     public init(
         queue: ComputerUseHostQueue = .shared,
         backend: any ComputerUseToolBackend = ComputerUseNativeHostBackend(),
         jev: JevDecision = JevDecision(),
+        browser: any ComputerUseToolBackend = ChromeProfileComputerUseBackend(),
         jevAvailable: @escaping @Sendable () -> Bool = {
             TypeSafeJevTransport.isConfigured()
         }
@@ -138,6 +140,7 @@ public struct ManagedComputerUseMCP: Sendable {
         self.queue = queue
         self.backend = backend
         self.jev = jev
+        self.browser = browser
         self.jevAvailable = jevAvailable
     }
 
@@ -159,7 +162,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -169,6 +172,10 @@ public struct ManagedComputerUseMCP: Sendable {
             let arguments = params?["arguments"] as? [String: Any] ?? [:]
             guard Self.advertisedToolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
+            }
+            if ChromeProfileComputerUseBackend.tools.contains(name) {
+                let result = await browser.invoke(name: name, arguments: arguments)
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
             }
             let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
             let targetPID = Self.targetPID(from: arguments)
@@ -251,6 +258,16 @@ public struct ManagedComputerUseMCP: Sendable {
             return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED. Without a key, return unambiguous labeled candidates for the Distill session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "click_element":
             return "Press an AX element by role and label in the exact background target."
+        case "browser_open":
+            return "Open an HTTP(S) URL in a new background tab in the connected Chrome profile. Never navigate a tab selected by the user."
+        case "browser_snapshot":
+            return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text."
+        case "browser_act":
+            return "Click, fill, type or scroll in the owned background tab using a fresh snapshot ref. Fails if the user selects the tab; confirm consequential actions."
+        case "browser_close":
+            return "Release the browser session without closing any Chrome tab; close the tab yourself when finished."
+        case "browser_status":
+            return "Check whether the separate Chrome extension is connected."
         case "doctor":
             return "Permission and native-backend diagnostics."
         default:
@@ -266,6 +283,16 @@ public struct ManagedComputerUseMCP: Sendable {
             "expected_state_token": ["type": "string"],
         ]
         switch name {
+        case "browser_open":
+            return ["type": "object", "properties": ["url": ["type": "string"]], "required": ["url"]]
+        case "browser_act":
+            return ["type": "object", "properties": [
+                "action": ["type": "string", "enum": ["click", "fill", "type", "scroll"]],
+                "ref": ["type": "string"], "text": ["type": "string"],
+                "delta_x": ["type": "number"], "delta_y": ["type": "number"],
+            ], "required": ["action"]]
+        case "browser_snapshot", "browser_close", "browser_status":
+            return ["type": "object", "properties": [String: Any]()]
         case screenshotTool:
             return [
                 "type": "object",

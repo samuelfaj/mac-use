@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "mac-use Computer Use",
+  "version": "1.0.0",
+  "description": "Let mac-use work in background tabs in your Chrome profile. Selecting a tab gives you control.",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Connect mac-use Computer Use"
+  }
+}
