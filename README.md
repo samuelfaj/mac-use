@@ -8,6 +8,10 @@ A macOS 14+ MCP server for controlling native macOS windows through Accessibilit
 
 ## English
 
+### Why use mac-use?
+
+mac-use is designed to work alongside your normal Mac use and compatible computer-use tools. For native windows, it acts through Accessibility on the exact window you choose, without activating that window or moving your physical pointer. It waits for recent keyboard or mouse activity to settle and stops if you take over. Its shared lock serializes actions with other computer-use tools that honor the same lock, including RemoteCode. Tools that do not use that lock cannot be guaranteed conflict-free. In Chrome, mac-use opens background tabs and stops controlling a tab as soon as you select it.
+
 ### What you need
 
 - macOS 14 or newer
@@ -102,6 +106,10 @@ The Chrome extension can read page text and form values, except password values.
 
 ## Español
 
+### ¿Por qué usar mac-use?
+
+mac-use está diseñado para funcionar junto con tu uso normal del Mac y con otras herramientas de control del ordenador compatibles. En ventanas nativas, actúa mediante Accesibilidad sobre la ventana exacta que eliges, sin activarla ni mover el puntero físico. Espera a que termine la actividad reciente del teclado o del ratón y se detiene si tomas el control. Su bloqueo compartido ordena las acciones junto con otras herramientas que respetan el mismo bloqueo, incluido RemoteCode. No se puede garantizar que no haya conflictos con herramientas que no lo utilizan. En Chrome, mac-use abre pestañas en segundo plano y deja de controlarlas cuando seleccionas una.
+
 ### Requisitos
 
 - macOS 14 o posterior
@@ -195,6 +203,10 @@ La extensión de Chrome puede leer el texto de las páginas y los valores de los
 ---
 
 ## Português (Brasil)
+
+### Por que usar o mac-use?
+
+O mac-use foi feito para conviver com o uso normal do Mac e com outras ferramentas de controle do computador que sejam compatíveis. Em janelas nativas, ele atua pela Acessibilidade na janela exata que você escolheu, sem ativá-la nem mover o cursor físico. Ele espera a atividade recente do teclado ou do mouse terminar e para quando você assume o controle. O bloqueio compartilhado coordena as ações com outras ferramentas que respeitam o mesmo bloqueio, incluindo o RemoteCode. Não é possível garantir que ferramentas que ignoram esse bloqueio não entrem em conflito. No Chrome, o mac-use abre abas em segundo plano e deixa de controlá-las assim que você as seleciona.
 
 ### O que você precisa
 
