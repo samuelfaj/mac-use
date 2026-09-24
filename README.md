@@ -1,10 +1,23 @@
 # mac-use
 
-A macOS 14+ computer-use [MCP](https://modelcontextprotocol.io/) server for Distill. It controls an exact, existing macOS window through Accessibility without activating the window or moving the physical pointer. An optional Chrome extension works in **new background tabs** in your current Chrome profile; it does not take over existing tabs. Selecting an automated tab transfers it to you and blocks further automation in that tab.
+A macOS 14+ MCP server for controlling native macOS windows through Accessibility. An optional Chrome extension lets it work in new background tabs in your current Chrome profile.
 
-## Build and connect to Distill
+[English](#english) | [Español](#español) | [Português (Brasil)](#português-brasil)
 
-Install Xcode Command Line Tools and Google Chrome (Chrome is needed only for browser tools). Clone this repository, then run:
+---
+
+## English
+
+### What you need
+
+- macOS 14 or newer
+- Xcode Command Line Tools (`xcode-select --install`)
+- [Distill](https://github.com/samuelfaj/mac-use) installed and available in Terminal
+- Google Chrome only if you want the browser tools
+
+### 1. Build and connect the MCP server
+
+Open Terminal and run:
 
 ```sh
 git clone git@github.com:samuelfaj/mac-use.git
@@ -14,55 +27,174 @@ distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
 distill mcp doctor mac-use
 ```
 
-Use a different clone URL if you do not use GitHub SSH. The executable is a local, stdio MCP server; leave the repository and built executable in place after registration. Restart Distill if a running session does not discover the new tools. `distill mcp doctor` checks startup and tool discovery; it does **not** verify macOS permissions or a Chrome connection.
+If you do not use GitHub SSH, replace the first command with the clone URL you normally use. Keep this folder in place after setup. Distill starts the server from the executable inside it. If Distill was already open, restart it after adding the server.
 
-For native windows, grant **Accessibility** and **Screen Recording** to the application that starts Distill if macOS prompts for them. Use the MCP `doctor` tool on an exact window to check native permissions. No administrator password is needed.
+### 2. Allow macOS access for native windows
 
-### Optional Jev credentials
+When macOS asks, allow **Accessibility** and **Screen Recording** for the app that runs Distill. These permissions are needed only for native macOS windows. You can use the MCP `doctor` tool on a window to check permissions.
 
-Set one of `JEV_API_KEY`, `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` in the environment that launches Distill; do not commit credentials. Direct TypeSafe credentials take priority (`JEV_API_KEY` before `TYPESAFE_API_KEY`) and use `POST https://api.typesafe.ai/v1/systemone` with `jev-latest`. Otherwise `OPENROUTER_API_KEY` uses `POST https://openrouter.ai/api/alpha/decisions` with `typesafe/jev-1.13`. If all three are absent, `jev_decide` makes no Jev request and returns safe candidates for the **Distill session LLM** to decide. A failed authenticated Jev request is an error, not a silent fallback. The Jev model configured as a Distill model tier is separate; this MCP cannot call Distill's private Jev client.
+### 3. Optional: set up Chrome
 
-## Install the Chrome extension
+The Chrome extension is included in this repository. Load it into the same Chrome profile you plan to use with mac-use:
 
-The extension lives in [`chrome-extension/`](chrome-extension/). It has its own native messaging host (`io.macuse.computer_use`) and registration; it does not overwrite RemoteCode's extension or native host. Google Chrome must be running in a regular, non-incognito profile. Loading the unpacked extension and choosing the Chrome profile are deliberate user actions:
+1. Open `chrome://extensions`.
+2. Turn on **Developer mode**.
+3. Click **Load unpacked** and select the `chrome-extension` folder inside the cloned `mac-use` folder.
+4. Open the extension's details page and copy its 32-letter **ID**. The screenshot shows where to find it.
 
-1. In **the Chrome profile you intend to use**, open `chrome://extensions`, enable **Developer mode**, and select **Load unpacked**. Choose the `chrome-extension` folder inside this repository (the folder containing `manifest.json`, not the repository root).
-2. Find **mac-use Computer Use** on that page and copy its 32-letter **ID**. From the repository root, run:
+   ![Chrome extension details page with the extension ID highlighted](docs/images/chrome-extension-id.jpg)
+
+5. In Terminal, from the `mac-use` folder, register the extension with the native host. Replace the example ID with the one from your Chrome page:
 
    ```sh
    .build/release/mac-use-mcp install-chrome-host YOUR_32_LETTER_EXTENSION_ID
    ```
 
-   This registers a user-local Chrome native messaging host in `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/io.macuse.computer_use.json`. The host wrapper and private socket live under `~/Library/Application Support/mac-use/ChromeComputerUse/`. It does not install a system daemon. Keep the release binary at the same path; after rebuilding it, the wrapper uses the new binary automatically. If you move the checkout or Chrome gives the extension a different ID, rerun this command with its new ID.
-3. Click the extension's toolbar icon to connect. Its badge should show **ON**. If the badge shows **OFF**, click again after checking that the ID and binary path are correct. A fresh Distill session can call `browser_status` to confirm `connected: true`.
+6. Click the mac-use extension icon in Chrome. Its badge should say **ON**. In Distill, call `browser_status`; it should report `connected: true`.
 
-Chrome's native messaging host is launched by Chrome when the extension connects; the MCP process communicates over a local user-only Unix socket. This integration uses Chrome's `nativeMessaging`, `tabs`, `scripting`, and HTTP(S) host permissions. It can read page text and form values (except password values), and can click, fill, type, or scroll **in tabs it created**. Install it only in a profile where you trust this access. Browser snapshots are not redacted and can be sent to your session's LLM; avoid sensitive pages. The extension does not export your cookies, launch a debugging browser, activate a tab, or use your physical pointer. It cannot operate Chrome internal pages, file URLs, incognito windows, or an already-selected tab.
+The extension uses Chrome's native messaging to connect to the MCP server. If you move the repository or reload the extension and its ID changes, run the registration command again with the new path or ID. Use a regular Chrome window, not Incognito.
 
-## Use native windows
+### Try it
 
-1. Call `list_windows` to identify an on-screen window by `target_pid` and `target_window_id`.
-2. Call `jev_decide` with that exact target and your goal. With a Jev key, it proposes `click_element`, `WAIT`, `DONE`, or `BLOCKED` after probability and authorization checks. Without a key it returns `mode: llm`, `operation: DEFER_TO_LLM` and eligible controls for the Distill session LLM to choose. Neither path posts input. Only filtered goal text and short Accessibility labels go to Jev; screenshots, coordinates, state tokens and field values do not. Filtering cannot detect every private label.
-3. For a permitted `click_element`, pass the exact target, `role`, `label`, and `expected_state_token`; observe again after each action. Confirm consequential actions explicitly. Native operations recheck window identity, state freshness, and recent human activity. `type` sets text in an already-focused, settable Accessibility field; Jev does not generate typed text.
+- For a native window, call `list_windows`, then use the returned exact window details with the relevant mac-use tools.
+- For Chrome, call `browser_status`, then `browser_open` with an `http://` or `https://` address. It opens a new background tab. Use `browser_snapshot` to inspect it and `browser_act` for supported page actions.
 
-`screenshot`, `zoom`, `get_ui_tree`, `cursor_position` and `doctor` are local observation tools. `get_ui_tree` contains unsanitized on-screen text. Native `left_click` uses Accessibility rather than moving the cursor. Unsupported input, unavailable permissions, ambiguous targets, and human activity fail closed. Native actions share RemoteCode's cross-process input lock.
+`distill mcp doctor` checks that the MCP server starts and exposes its tools. It does not confirm macOS permissions or a Chrome connection.
 
-## Use Chrome background tabs
+### If Chrome says "Specified native messaging host not found"
 
-1. Call `browser_status` to verify the extension is connected. Call `browser_open` with an HTTP(S) `url` to create a **new, inactive tab (muted immediately when still unselected)** in the connected profile. It does not reuse the tab you are browsing.
-2. Call `browser_snapshot` after navigation finishes. It returns page text and element `ref`s. Call `browser_act` with `action: click`, `fill`, `type`, or `scroll`; use the fresh `ref` for element actions (`scroll` can omit it). Provide `text` for fill/type or `delta_x`/`delta_y` for scroll. Re-snapshot before relying on refs after page changes; never guess a ref. Explicitly confirm consequential actions.
-3. Call `browser_close` when finished. It releases the session handle but **leaves the tab open** for you to close manually: Chrome has no atomic “remove only if still inactive” operation. If you select a tab, the extension will not read or mutate it again. After releasing the old handle, use `browser_open` to create a new background tab.
+The extension's native host registration is missing or does not match the extension ID. From the `mac-use` folder, run the registration command again with the current ID from `chrome://extensions`. Then click the extension icon to reconnect. Check that `.build/release/mac-use-mcp` is still at the same path and that the extension is loaded in the Chrome profile you are using.
 
-Chrome tools do **not** call Jev automatically: Distill's session LLM decides from the snapshot. The Jev decision tool applies only to native Accessibility windows. Browser sessions are scoped to one MCP server process and extension connection; restarting either loses those session handles. If Chrome disconnects, it releases session handles and leaves all tabs open. If you select a tab, the extension leaves it alone. Avoid entering passwords or other secrets through `browser_act` because browser tool arguments and snapshots are visible to your agent session.
+### Privacy and control
 
-## Verification and limits
+The Chrome extension can read page text and form values, except password values. It can click, fill, type, and scroll in tabs that it opened. It does not automate your selected tab; selecting an automated tab gives control back to you. Page content and snapshots are visible to your Distill session, so do not use the browser tools on pages containing information you do not want to share with that session. The extension requests access to HTTP and HTTPS sites because it needs to operate on pages you ask it to open.
+
+---
+
+## Español
+
+### Requisitos
+
+- macOS 14 o posterior
+- Xcode Command Line Tools (`xcode-select --install`)
+- [Distill](https://github.com/samuelfaj/mac-use) instalado y disponible desde Terminal
+- Google Chrome solo si quieres usar las herramientas del navegador
+
+### 1. Compilar y conectar el servidor MCP
+
+Abre Terminal y ejecuta:
 
 ```sh
-swift test
-node --test --experimental-default-type=module Tests/ChromeExtensionTests.mjs
+git clone git@github.com:samuelfaj/mac-use.git
+cd mac-use
+swift build -c release
+distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+distill mcp doctor mac-use
 ```
 
-Tests use fake windows, a fake Jev transport and a mocked browser connection; no test sends input to the user's Mac or makes a live Jev request. Run `distill mcp doctor mac-use` after rebuilding and use `browser_status` after you install and connect Chrome. A successful doctor handshake alone does not prove Chrome is connected. This repository does not run an autonomous agent loop, generate text, or include a Core ML detector or local OCR. The native backend uses macOS Accessibility; if a target is absent or ambiguous it stops instead of guessing coordinates.
+Si no usas SSH de GitHub, cambia el primer comando por la URL que utilizas normalmente. Conserva esta carpeta después de la instalación. Distill inicia el servidor desde el ejecutable que está dentro de ella. Si Distill ya estaba abierto, reinícialo después de añadir el servidor.
 
-## Origins
+### 2. Permitir el acceso de macOS a las ventanas nativas
 
-The native backend and Chrome extension are adapted from RemoteCode's macOS computer-use implementation. The Jev decision boundary follows TypeSafe's [System One API](https://docs.typesafe.ai/introduction/quickstart) and [Implementing Computer-Use Using Jev on macOS](https://blog.fka.dev/blog/2026-09-19-implementing-computer-use-using-jev-on-macos/). The [jev-browser project](https://github.com/jkudish/jev-browser) informed the one-step typed-choice approach; its code and Playwright browser are not included.
+Cuando macOS lo solicite, permite **Accesibilidad** y **Grabación de pantalla** para la aplicación que ejecuta Distill. Estos permisos solo hacen falta para controlar ventanas nativas de macOS. Puedes usar la herramienta MCP `doctor` sobre una ventana para comprobar los permisos.
+
+### 3. Opcional: configurar Chrome
+
+La extensión de Chrome está incluida en este repositorio. Cárgala en el mismo perfil de Chrome que quieras usar con mac-use:
+
+1. Abre `chrome://extensions`.
+2. Activa el **Modo de desarrollador**.
+3. Haz clic en **Cargar descomprimida** y selecciona la carpeta `chrome-extension` dentro de la carpeta clonada `mac-use`.
+4. Abre los detalles de la extensión y copia su **ID** de 32 letras. La imagen indica dónde encontrarlo.
+
+   ![Página de detalles de la extensión de Chrome con el ID resaltado](docs/images/chrome-extension-id.jpg)
+
+5. En Terminal, desde la carpeta `mac-use`, registra la extensión con el host nativo. Sustituye el ID de ejemplo por el que aparece en Chrome:
+
+   ```sh
+   .build/release/mac-use-mcp install-chrome-host ID_DE_32_LETRAS
+   ```
+
+6. Haz clic en el icono de mac-use en Chrome. El indicador debe mostrar **ON**. En Distill, llama a `browser_status`; la respuesta debe incluir `connected: true`.
+
+La extensión usa la mensajería nativa de Chrome para conectarse al servidor MCP. Si mueves el repositorio o vuelves a cargar la extensión y cambia su ID, ejecuta otra vez el comando de registro con la ruta o el ID nuevos. Usa una ventana normal de Chrome, no el modo incógnito.
+
+### Pruébalo
+
+- Para una ventana nativa, llama a `list_windows` y usa los datos exactos de la ventana con las herramientas correspondientes de mac-use.
+- Para Chrome, llama a `browser_status` y después a `browser_open` con una dirección `http://` o `https://`. Se abrirá una pestaña nueva en segundo plano. Usa `browser_snapshot` para verla y `browser_act` para realizar las acciones disponibles.
+
+`distill mcp doctor` comprueba que el servidor MCP se inicia y ofrece sus herramientas. No comprueba los permisos de macOS ni la conexión con Chrome.
+
+### Si Chrome muestra "Specified native messaging host not found"
+
+Falta el registro del host nativo o el ID registrado no coincide con el de la extensión. Desde la carpeta `mac-use`, ejecuta de nuevo el comando de registro con el ID actual de `chrome://extensions`. Después, haz clic en el icono de la extensión para conectarla. Comprueba que `.build/release/mac-use-mcp` siga en la misma ruta y que la extensión esté cargada en el perfil de Chrome que estás usando.
+
+### Privacidad y control
+
+La extensión de Chrome puede leer el texto de las páginas y los valores de los formularios, excepto las contraseñas. Puede hacer clic, rellenar campos, escribir y desplazarse en las pestañas que abrió. No controla la pestaña seleccionada; si seleccionas una pestaña automatizada, recuperas el control. El contenido y las capturas de las páginas quedan visibles para tu sesión de Distill. No uses estas herramientas en páginas con información que no quieras compartir con esa sesión. La extensión solicita acceso a sitios HTTP y HTTPS para poder trabajar en las páginas que le pidas abrir.
+
+---
+
+## Português (Brasil)
+
+### O que você precisa
+
+- macOS 14 ou mais recente
+- Xcode Command Line Tools (`xcode-select --install`)
+- [Distill](https://github.com/samuelfaj/mac-use) instalado e disponível no Terminal
+- Google Chrome somente se você quiser usar as ferramentas do navegador
+
+### 1. Compile e conecte o servidor MCP
+
+Abra o Terminal e execute:
+
+```sh
+git clone git@github.com:samuelfaj/mac-use.git
+cd mac-use
+swift build -c release
+distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+distill mcp doctor mac-use
+```
+
+Se você não usa SSH do GitHub, substitua o primeiro comando pela URL que costuma usar. Mantenha essa pasta no mesmo lugar depois da instalação. O Distill inicia o servidor pelo executável que está dentro dela. Se o Distill já estiver aberto, reinicie-o depois de adicionar o servidor.
+
+### 2. Permita o acesso do macOS às janelas nativas
+
+Quando o macOS solicitar, permita **Acessibilidade** e **Gravação de Tela** para o aplicativo que inicia o Distill. Essas permissões são necessárias apenas para controlar janelas nativas do macOS. Você pode usar a ferramenta MCP `doctor` em uma janela para verificar as permissões.
+
+### 3. Opcional: configure o Chrome
+
+A extensão do Chrome está incluída neste repositório. Carregue-a no mesmo perfil do Chrome que pretende usar com o mac-use:
+
+1. Abra `chrome://extensions`.
+2. Ative o **Modo do desenvolvedor**.
+3. Clique em **Carregar sem compactação** e selecione a pasta `chrome-extension` dentro da pasta clonada `mac-use`.
+4. Abra os detalhes da extensão e copie o **ID** de 32 letras. A imagem mostra onde encontrá-lo.
+
+   ![Página de detalhes da extensão do Chrome com o ID destacado](docs/images/chrome-extension-id.jpg)
+
+5. No Terminal, dentro da pasta `mac-use`, registre a extensão com o host nativo. Troque o ID de exemplo pelo ID exibido no Chrome:
+
+   ```sh
+   .build/release/mac-use-mcp install-chrome-host SEU_ID_DE_32_LETRAS
+   ```
+
+6. Clique no ícone da extensão mac-use no Chrome. O indicador deve mostrar **ON**. No Distill, chame `browser_status`; a resposta deve incluir `connected: true`.
+
+A extensão usa o sistema de mensagens nativas do Chrome para se conectar ao servidor MCP. Se você mover o repositório ou recarregar a extensão e o ID mudar, execute novamente o comando de registro com o caminho ou ID atualizado. Use uma janela normal do Chrome, não o modo anônimo.
+
+### Teste
+
+- Para uma janela nativa, chame `list_windows` e use os dados exatos da janela com as ferramentas correspondentes do mac-use.
+- Para o Chrome, chame `browser_status` e depois `browser_open` com um endereço `http://` ou `https://`. Uma nova aba será aberta em segundo plano. Use `browser_snapshot` para conferir a página e `browser_act` para executar as ações disponíveis.
+
+`distill mcp doctor` verifica se o servidor MCP inicia e disponibiliza as ferramentas. Ele não verifica as permissões do macOS nem a conexão com o Chrome.
+
+### Se o Chrome mostrar "Specified native messaging host not found"
+
+O registro do host nativo está ausente ou não corresponde ao ID da extensão. Na pasta `mac-use`, execute novamente o comando de registro com o ID atual de `chrome://extensions`. Depois, clique no ícone da extensão para conectar. Confira se `.build/release/mac-use-mcp` continua no mesmo caminho e se a extensão está carregada no perfil do Chrome que você está usando.
+
+### Privacidade e controle
+
+A extensão do Chrome pode ler o texto das páginas e os valores dos formulários, exceto senhas. Ela pode clicar, preencher campos, digitar e rolar em abas que abriu. Ela não controla a aba selecionada; ao selecionar uma aba automatizada, você retoma o controle. O conteúdo e as capturas das páginas ficam visíveis para a sessão do Distill. Não use essas ferramentas em páginas com informações que você não queira compartilhar com essa sessão. A extensão solicita acesso a sites HTTP e HTTPS para poder operar nas páginas que você pedir para abrir.
