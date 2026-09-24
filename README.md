@@ -12,10 +12,10 @@ A macOS 14+ MCP server for controlling native macOS windows through Accessibilit
 
 - macOS 14 or newer
 - Xcode Command Line Tools (`xcode-select --install`)
-- [Distill](https://github.com/samuelfaj/mac-use) installed and available in Terminal
+- An MCP client: Distill, Codex, Claude Code, or Grok Build
 - Google Chrome only if you want the browser tools
 
-### 1. Build and connect the MCP server
+### 1. Build the MCP server
 
 Open Terminal and run:
 
@@ -23,17 +23,46 @@ Open Terminal and run:
 git clone git@github.com:samuelfaj/mac-use.git
 cd mac-use
 swift build -c release
-distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
-distill mcp doctor mac-use
 ```
 
-If you do not use GitHub SSH, replace the first command with the clone URL you normally use. Keep this folder in place after setup. Distill starts the server from the executable inside it. If Distill was already open, restart it after adding the server.
+If you do not use GitHub SSH, replace the first command with the clone URL you normally use. Keep this folder in place after setup. The MCP clients below all start the same executable from this folder.
 
-### 2. Allow macOS access for native windows
+### 2. Connect it to your MCP client
 
-When macOS asks, allow **Accessibility** and **Screen Recording** for the app that runs Distill. These permissions are needed only for native macOS windows. You can use the MCP `doctor` tool on a window to check permissions.
+Run **one** command for the client you use, from inside the `mac-use` folder:
 
-### 3. Optional: set up Chrome
+- **Distill:**
+
+  ```sh
+  distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  distill mcp doctor mac-use
+  ```
+
+- **Codex:**
+
+  ```sh
+  codex mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Claude Code:**
+
+  ```sh
+  claude mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Grok Build:**
+
+  ```sh
+  grok mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+If the client was already open, restart it after adding the server. In Claude Code, approve the server if prompted. Keep the repository at the same path; each client starts the executable from there.
+
+### 3. Allow macOS access for native windows
+
+When macOS asks, allow **Accessibility** and **Screen Recording** for the app that runs your MCP client. These permissions are needed only for native macOS windows. You can use the MCP `doctor` tool on a window to check permissions.
+
+### 4. Optional: set up Chrome
 
 The Chrome extension is included in this repository. Load it into the same Chrome profile you plan to use with mac-use:
 
@@ -50,7 +79,7 @@ The Chrome extension is included in this repository. Load it into the same Chrom
    .build/release/mac-use-mcp install-chrome-host YOUR_32_LETTER_EXTENSION_ID
    ```
 
-6. Click the mac-use extension icon in Chrome. Its badge should say **ON**. In Distill, call `browser_status`; it should report `connected: true`.
+6. Click the mac-use extension icon in Chrome. Its badge should say **ON**. In your MCP client, call `browser_status`; it should report `connected: true`.
 
 The extension uses Chrome's native messaging to connect to the MCP server. If you move the repository or reload the extension and its ID changes, run the registration command again with the new path or ID. Use a regular Chrome window, not Incognito.
 
@@ -77,10 +106,10 @@ The Chrome extension can read page text and form values, except password values.
 
 - macOS 14 o posterior
 - Xcode Command Line Tools (`xcode-select --install`)
-- [Distill](https://github.com/samuelfaj/mac-use) instalado y disponible desde Terminal
+- Un cliente MCP: Distill, Codex, Claude Code o Grok Build
 - Google Chrome solo si quieres usar las herramientas del navegador
 
-### 1. Compilar y conectar el servidor MCP
+### 1. Compilar el servidor MCP
 
 Abre Terminal y ejecuta:
 
@@ -88,17 +117,46 @@ Abre Terminal y ejecuta:
 git clone git@github.com:samuelfaj/mac-use.git
 cd mac-use
 swift build -c release
-distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
-distill mcp doctor mac-use
 ```
 
-Si no usas SSH de GitHub, cambia el primer comando por la URL que utilizas normalmente. Conserva esta carpeta después de la instalación. Distill inicia el servidor desde el ejecutable que está dentro de ella. Si Distill ya estaba abierto, reinícialo después de añadir el servidor.
+Si no usas SSH de GitHub, cambia el primer comando por la URL que utilizas normalmente. Conserva esta carpeta después de la instalación. Los clientes MCP de abajo inician el mismo ejecutable desde esta carpeta.
 
-### 2. Permitir el acceso de macOS a las ventanas nativas
+### 2. Conectarlo a tu cliente MCP
 
-Cuando macOS lo solicite, permite **Accesibilidad** y **Grabación de pantalla** para la aplicación que ejecuta Distill. Estos permisos solo hacen falta para controlar ventanas nativas de macOS. Puedes usar la herramienta MCP `doctor` sobre una ventana para comprobar los permisos.
+Ejecuta **un solo** comando, según el cliente que uses, desde la carpeta `mac-use`:
 
-### 3. Opcional: configurar Chrome
+- **Distill:**
+
+  ```sh
+  distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  distill mcp doctor mac-use
+  ```
+
+- **Codex:**
+
+  ```sh
+  codex mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Claude Code:**
+
+  ```sh
+  claude mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Grok Build:**
+
+  ```sh
+  grok mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+Si el cliente ya estaba abierto, reinícialo después de añadir el servidor. En Claude Code, acepta el servidor si aparece una solicitud. Conserva el repositorio en la misma ruta; cada cliente inicia el ejecutable desde allí.
+
+### 3. Permitir el acceso de macOS a las ventanas nativas
+
+Cuando macOS lo solicite, permite **Accesibilidad** y **Grabación de pantalla** para la aplicación que ejecuta tu cliente MCP. Estos permisos solo hacen falta para controlar ventanas nativas de macOS. Puedes usar la herramienta MCP `doctor` sobre una ventana para comprobar los permisos.
+
+### 4. Opcional: configurar Chrome
 
 La extensión de Chrome está incluida en este repositorio. Cárgala en el mismo perfil de Chrome que quieras usar con mac-use:
 
@@ -115,7 +173,7 @@ La extensión de Chrome está incluida en este repositorio. Cárgala en el mismo
    .build/release/mac-use-mcp install-chrome-host ID_DE_32_LETRAS
    ```
 
-6. Haz clic en el icono de mac-use en Chrome. El indicador debe mostrar **ON**. En Distill, llama a `browser_status`; la respuesta debe incluir `connected: true`.
+6. Haz clic en el icono de mac-use en Chrome. El indicador debe mostrar **ON**. En tu cliente MCP, llama a `browser_status`; la respuesta debe incluir `connected: true`.
 
 La extensión usa la mensajería nativa de Chrome para conectarse al servidor MCP. Si mueves el repositorio o vuelves a cargar la extensión y cambia su ID, ejecuta otra vez el comando de registro con la ruta o el ID nuevos. Usa una ventana normal de Chrome, no el modo incógnito.
 
@@ -142,10 +200,10 @@ La extensión de Chrome puede leer el texto de las páginas y los valores de los
 
 - macOS 14 ou mais recente
 - Xcode Command Line Tools (`xcode-select --install`)
-- [Distill](https://github.com/samuelfaj/mac-use) instalado e disponível no Terminal
+- Um cliente MCP: Distill, Codex, Claude Code ou Grok Build
 - Google Chrome somente se você quiser usar as ferramentas do navegador
 
-### 1. Compile e conecte o servidor MCP
+### 1. Compile o servidor MCP
 
 Abra o Terminal e execute:
 
@@ -153,17 +211,46 @@ Abra o Terminal e execute:
 git clone git@github.com:samuelfaj/mac-use.git
 cd mac-use
 swift build -c release
-distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
-distill mcp doctor mac-use
 ```
 
-Se você não usa SSH do GitHub, substitua o primeiro comando pela URL que costuma usar. Mantenha essa pasta no mesmo lugar depois da instalação. O Distill inicia o servidor pelo executável que está dentro dela. Se o Distill já estiver aberto, reinicie-o depois de adicionar o servidor.
+Se você não usa SSH do GitHub, substitua o primeiro comando pela URL que costuma usar. Mantenha essa pasta no mesmo lugar depois da instalação. Os clientes MCP abaixo iniciam o mesmo executável dentro dessa pasta.
 
-### 2. Permita o acesso do macOS às janelas nativas
+### 2. Conecte ao seu cliente MCP
 
-Quando o macOS solicitar, permita **Acessibilidade** e **Gravação de Tela** para o aplicativo que inicia o Distill. Essas permissões são necessárias apenas para controlar janelas nativas do macOS. Você pode usar a ferramenta MCP `doctor` em uma janela para verificar as permissões.
+Execute **apenas um** comando, de acordo com o cliente que você usa, dentro da pasta `mac-use`:
 
-### 3. Opcional: configure o Chrome
+- **Distill:**
+
+  ```sh
+  distill mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  distill mcp doctor mac-use
+  ```
+
+- **Codex:**
+
+  ```sh
+  codex mcp add mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Claude Code:**
+
+  ```sh
+  claude mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+- **Grok Build:**
+
+  ```sh
+  grok mcp add --scope user mac-use -- "$(pwd)/.build/release/mac-use-mcp"
+  ```
+
+Se o cliente já estiver aberto, reinicie-o depois de adicionar o servidor. No Claude Code, aprove o servidor se aparecer uma solicitação. Mantenha o repositório no mesmo caminho; cada cliente inicia o executável a partir dele.
+
+### 3. Permita o acesso do macOS às janelas nativas
+
+Quando o macOS solicitar, permita **Acessibilidade** e **Gravação de Tela** para o aplicativo que inicia seu cliente MCP. Essas permissões são necessárias apenas para controlar janelas nativas do macOS. Você pode usar a ferramenta MCP `doctor` em uma janela para verificar as permissões.
+
+### 4. Opcional: configure o Chrome
 
 A extensão do Chrome está incluída neste repositório. Carregue-a no mesmo perfil do Chrome que pretende usar com o mac-use:
 
@@ -180,7 +267,7 @@ A extensão do Chrome está incluída neste repositório. Carregue-a no mesmo pe
    .build/release/mac-use-mcp install-chrome-host SEU_ID_DE_32_LETRAS
    ```
 
-6. Clique no ícone da extensão mac-use no Chrome. O indicador deve mostrar **ON**. No Distill, chame `browser_status`; a resposta deve incluir `connected: true`.
+6. Clique no ícone da extensão mac-use no Chrome. O indicador deve mostrar **ON**. No seu cliente MCP, chame `browser_status`; a resposta deve incluir `connected: true`.
 
 A extensão usa o sistema de mensagens nativas do Chrome para se conectar ao servidor MCP. Se você mover o repositório ou recarregar a extensão e o ID mudar, execute novamente o comando de registro com o caminho ou ID atualizado. Use uma janela normal do Chrome, não o modo anônimo.
 
