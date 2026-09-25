@@ -8,6 +8,64 @@ import ScreenCaptureKit
 
 /// Exact host identity. A PID without a window ID is deliberately not enough
 /// for a mutating operation: one process can own several independent windows.
+enum NativeWindowRestoreSequence {
+    static func run(
+        wasMinimized: Bool,
+        unminimize: () -> Bool,
+        focusExactWindow: () -> Bool,
+        activateApp: () -> Bool,
+        rollbackMinimized: () -> Void
+    ) -> Bool {
+        if wasMinimized && !unminimize() { return false }
+        guard focusExactWindow() else {
+            if wasMinimized { rollbackMinimized() }
+            return false
+        }
+        guard activateApp() else {
+            if wasMinimized { rollbackMinimized() }
+            return false
+        }
+        return true
+    }
+}
+
+enum NativeSemanticTargetSearch {
+    static func uniqueMatch<Node>(
+        root: Node,
+        role: String,
+        label: String,
+        attributesOf: (Node) -> (role: String?, title: String?, description: String?)?,
+        childrenOf: (Node) -> [Node]?
+    ) -> Node? {
+        var matches: [Node] = []
+        var complete = true
+        func visit(_ node: Node, depth: Int) {
+            guard complete else { return }
+            guard depth < 32, let attributes = attributesOf(node) else {
+                complete = false
+                return
+            }
+            if attributes.role == role && (attributes.title == label || attributes.description == label) {
+                matches.append(node)
+                if matches.count > 1 { complete = false; return }
+            }
+            guard let children = childrenOf(node) else {
+                complete = false
+                return
+            }
+            for child in children { visit(child, depth: depth + 1) }
+        }
+        visit(root, depth: 0)
+        return complete && matches.count == 1 ? matches[0] : nil
+    }
+}
+
+public enum ComputerUseNativeClickResult: Sendable {
+    case applied
+    case noAXTarget
+    case failed
+}
+
 public struct ComputerUseNativeHostTarget: Sendable, Equatable, Hashable {
     public let pid: Int32
     public let windowID: UInt32
@@ -247,10 +305,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public var capture: @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult
         public var uiTree: @Sendable (ComputerUseNativeHostTarget) -> String?
         public var semanticAction: @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool
-        public var leftClick: @Sendable (ComputerUseNativeHostTarget, [Double]) -> Bool
+        public var leftClick: @Sendable (ComputerUseNativeHostTarget, [Double]) -> ComputerUseNativeClickResult
+        public var focusedTarget: @Sendable (ComputerUseNativeHostTarget) -> Bool
         public var typeText: @Sendable (ComputerUseNativeHostTarget, String) -> Bool
         public var pixelAction: @Sendable (ComputerUseNativeHostTarget, String, [Double]) -> Bool
-        public var activate: @Sendable (ComputerUseNativeHostTarget) -> Void
+        public var activate: @Sendable (ComputerUseNativeHostTarget) -> Bool
         /// Executable of the app that launched this MCP (TCC attributes Screen
         /// Recording / Accessibility to that responsible app, not to this helper).
         public var hostLauncherPath: @Sendable () -> String? = {
@@ -285,8 +344,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             semanticAction: @escaping @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool = {
                 NativePlatform.semanticAction(target: $0, role: $1, label: $2)
             },
-            leftClick: @escaping @Sendable (ComputerUseNativeHostTarget, [Double]) -> Bool = {
+            leftClick: @escaping @Sendable (ComputerUseNativeHostTarget, [Double]) -> ComputerUseNativeClickResult = {
                 NativePlatform.leftClick(target: $0, coordinate: $1)
+            },
+            focusedTarget: @escaping @Sendable (ComputerUseNativeHostTarget) -> Bool = {
+                NativePlatform.focusedTarget(target: $0)
             },
             typeText: @escaping @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
                 NativePlatform.typeText(target: $0, text: $1)
@@ -294,7 +356,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             pixelAction: @escaping @Sendable (ComputerUseNativeHostTarget, String, [Double]) -> Bool = {
                 NativePlatform.pixelAction(target: $0, name: $1, coordinate: $2)
             },
-            activate: @escaping @Sendable (ComputerUseNativeHostTarget) -> Void = { _ in },
+            activate: @escaping @Sendable (ComputerUseNativeHostTarget) -> Bool = {
+                NativePlatform.restoreWindow(target: $0)
+            },
             hostLauncherPath: @escaping @Sendable () -> String? = {
                 NativePlatform.hostLauncherExecutablePath()
             }
@@ -310,6 +374,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             self.uiTree = uiTree
             self.semanticAction = semanticAction
             self.leftClick = leftClick
+            self.focusedTarget = focusedTarget
             self.typeText = typeText
             self.pixelAction = pixelAction
             self.activate = activate
@@ -550,8 +615,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let observation = await makeObservation(window: window, kind: .geometry)
             return ComputerUseToolResult(text: encodeObservation(observation) + "\n"
                 + "cursor_position: \(Self.cursorPosition())")
-        case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "open_application":
-            let kind: TokenKind = ["type", "click_element"].contains(name) ? .semantic : .pixel
+        case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "open_application", "restore_window":
+            let kind: TokenKind = name == "restore_window" || name == "key" ? .geometry : (["type", "click_element"].contains(name) ? .semantic : .pixel)
             // Preflight only needs metadata. Read the expensive pixels/AX tree
             // once, after the human-activity check, in mutate's final validation.
             let observation = await makeObservation(window: window, kind: .geometry)
@@ -714,8 +779,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         // Re-read the capability-specific content immediately before the
         // mutation. The observation token is never a substitute for this
         // final race check.
+        guard let freshWindow = resolve(target: target, arguments: arguments) else {
+            return failure(.target_not_found, encodeObservation(observation))
+        }
         let freshObservation = await makeObservation(
-            window: window,
+            window: freshWindow,
             kind: tokenKind,
             pixelScope: expectedPixelScope
         )
@@ -729,8 +797,17 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         switch name {
-        case "left_click":
-            guard let localCoordinate = Self.localCoordinate(arguments["coordinate"]) else {
+        case "left_click", "right_click", "mouse_move", "scroll":
+            guard freshObservation.accessibilityPermission else {
+                return failure(.permission_required, encodeObservation(freshObservation))
+            }
+            guard let localCoordinate = Self.localCoordinate(arguments["coordinate"]),
+                  let coordinate = pixelCoordinate(
+                    local: localCoordinate,
+                    window: freshWindow,
+                    observation: freshObservation,
+                    scope: expectedPixelScope
+                  ) else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
             guard freshObservation.screenCapturePermission,
@@ -738,54 +815,70 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   !freshObservation.isMinimized else {
                 return failure(.pixel_target_not_renderable, encodeObservation(freshObservation))
             }
-            guard let currentWindow = resolve(target: target, arguments: arguments),
-                  currentWindow == window,
-                  currentWindow.bounds.width.isFinite,
-                  currentWindow.bounds.height.isFinite,
-                  currentWindow.bounds.width > 0,
-                  currentWindow.bounds.height > 0 else {
+            guard let currentWindow = resolve(target: target, arguments: arguments), currentWindow == freshWindow else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
-            guard let expectedPixelScope,
-                  let freshEnvelope = Self.decodePixelToken(freshObservation.stateToken),
-                  expectedPixelScope == freshEnvelope.scope,
-                  expectedPixelScope.fullImageSize.count == 2,
-                  expectedPixelScope.outputImageSize.count == 2,
-                  expectedPixelScope.fullImageSize.allSatisfy({ $0 > 0 }),
-                  expectedPixelScope.outputImageSize.allSatisfy({ $0 > 0 }),
-                  localCoordinate[0] >= 0,
-                  localCoordinate[1] >= 0,
-                  localCoordinate[0] < Double(expectedPixelScope.outputImageSize[0]),
-                  localCoordinate[1] < Double(expectedPixelScope.outputImageSize[1]) else {
-                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            if hooks.userActivity(target) == .human {
+                return failure(.human_activity, encodeObservation(freshObservation))
             }
-            let fullPixelCoordinate: [Double]
-            if let region = expectedPixelScope.region,
-               region.count == 4 {
-                fullPixelCoordinate = [
-                    Double(region[0]) + localCoordinate[0],
-                    Double(region[1]) + localCoordinate[1],
-                ]
+            if name == "left_click" {
+                switch hooks.leftClick(target, coordinate) {
+                case .applied:
+                    break
+                case .failed:
+                    return failure(.semantic_action_failed, encodeObservation(freshObservation))
+                case .noAXTarget:
+                    guard hooks.focusedTarget(target) else {
+                        return failure(.focus_required, encodeObservation(freshObservation))
+                    }
+                    guard hooks.pixelAction(target, name, coordinate) else {
+                        return failure(.semantic_action_failed, encodeObservation(freshObservation))
+                    }
+                }
             } else {
-                fullPixelCoordinate = localCoordinate
+                var actionCoordinate = coordinate
+                if name == "scroll" {
+                    guard let deltaX = Self.finiteNumber(arguments["delta_x"]),
+                          let deltaY = Self.finiteNumber(arguments["delta_y"]),
+                          abs(deltaX) <= 10_000, abs(deltaY) <= 10_000 else {
+                        return failure(.semantic_action_failed, encodeObservation(freshObservation))
+                    }
+                    actionCoordinate += [deltaX, deltaY]
+                }
+                guard hooks.focusedTarget(target) else {
+                    return failure(.focus_required, encodeObservation(freshObservation))
+                }
+                guard hooks.pixelAction(target, name, actionCoordinate) else {
+                    return failure(.semantic_action_failed, encodeObservation(freshObservation))
+                }
             }
-            let scaleX = Double(expectedPixelScope.fullImageSize[0]) / currentWindow.bounds.width
-            let scaleY = Double(expectedPixelScope.fullImageSize[1]) / currentWindow.bounds.height
-            guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
-                  fullPixelCoordinate[0] >= 0,
-                  fullPixelCoordinate[1] >= 0,
-                  fullPixelCoordinate[0] < Double(expectedPixelScope.fullImageSize[0]),
-                  fullPixelCoordinate[1] < Double(expectedPixelScope.fullImageSize[1]) else {
-                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            guard let postWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
             }
-            let coordinate = [
-                currentWindow.bounds.origin.x + fullPixelCoordinate[0] / scaleX,
-                currentWindow.bounds.origin.y + fullPixelCoordinate[1] / scaleY,
-            ]
-            guard hooks.leftClick(target, coordinate) else {
-                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            let postObservation = await makeObservation(window: postWindow, kind: .pixel, pixelScope: expectedPixelScope)
+            return ComputerUseToolResult(text: "native \(name) applied\n\(encodeObservation(postObservation))")
+        case "key":
+            guard hooks.focusedTarget(target),
+                  let parsedKey = Self.parsedKey(arguments["key"], modifiers: arguments["modifiers"]) else {
+                return failure(.focus_required, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native left click applied\n\(encodeObservation(freshObservation))")
+            guard hooks.userActivity(target) != .human else {
+                return failure(.human_activity, encodeObservation(freshObservation))
+            }
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            guard hooks.pixelAction(target, "key", [Double(parsedKey.keyCode), Double(parsedKey.flags)]) else {
+                return failure(.focus_required, encodeObservation(freshObservation))
+            }
+            guard let postWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            let postObservation = await makeObservation(window: postWindow, kind: .geometry)
+            return ComputerUseToolResult(text: "native key applied; target remained explicitly focused\n\(encodeObservation(postObservation))")
         case "click_element":
             guard freshObservation.accessibilityPermission,
                   freshObservation.capabilities.contains("semantic_ax") else {
@@ -793,28 +886,53 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             let role = arguments["role"] as? String ?? ""
             let label = arguments["label"] as? String ?? ""
-            guard !role.isEmpty, !label.isEmpty,
-                  hooks.semanticAction(target, role, label) else {
+            guard !role.isEmpty, !label.isEmpty else {
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            }
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            guard hooks.semanticAction(target, role, label) else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
             return ComputerUseToolResult(text: "native semantic action applied\n\(encodeObservation(freshObservation))")
+        case "restore_window":
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            guard hooks.activate(target) else {
+                return failure(.activation_forbidden, encodeObservation(freshObservation))
+            }
+            guard let restoredWindow = resolve(target: target, arguments: arguments),
+                  restoredWindow.target == target else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            let restoredObservation = await makeObservation(window: restoredWindow, kind: .geometry)
+            return ComputerUseToolResult(text: "native exact window restored; use this fresh state token before further actions\n\(encodeObservation(restoredObservation))")
         case "open_application":
             // Activation changes the human's active app and is never implicit.
             return failure(.activation_forbidden, encodeObservation(freshObservation))
         case "type":
             let text = arguments["text"] as? String ?? ""
-            guard freshObservation.capabilities.contains("semantic_ax"),
-                  !text.isEmpty, hooks.typeText(target, text) else {
+            guard freshObservation.capabilities.contains("semantic_ax"), !text.isEmpty else {
+                return failure(.focus_required, encodeObservation(freshObservation))
+            }
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            guard hooks.typeText(target, text) else {
                 return failure(.focus_required, encodeObservation(freshObservation))
             }
             return ComputerUseToolResult(text: "native background typing applied\n\(encodeObservation(freshObservation))")
-        case "right_click", "mouse_move", "scroll", "key":
-            // These operations traditionally depend on focus or a physical
-            // cursor. Native host control cannot steal either from the human.
-            return failure(
-                name == "key" ? .focus_required : .pixel_target_not_renderable,
-                encodeObservation(freshObservation)
-            )
         default:
             return failure(.invalid_target, "unsupported native mutation")
         }
@@ -1064,6 +1182,92 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return nil
         }
         return result.count == 2 ? result : nil
+    }
+
+    private struct ParsedKey {
+        let keyCode: UInt16
+        let flags: UInt64
+    }
+
+    private static func parsedKey(_ value: Any?, modifiers: Any?) -> ParsedKey? {
+        guard let name = value as? String,
+              name.count == 1 || ["return", "tab", "space", "delete", "escape", "left", "right", "up", "down"].contains(name.lowercased()) else { return nil }
+        let upper = name.uppercased()
+        let keyCodes: [String: UInt16] = [
+            "A": 0, "S": 1, "D": 2, "F": 3, "H": 4, "G": 5, "Z": 6, "X": 7, "C": 8,
+            "V": 9, "B": 11, "Q": 12, "W": 13, "E": 14, "R": 15, "Y": 16, "T": 17,
+            "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25,
+            "7": 26, "8": 28, "0": 29, "O": 31, "U": 32, "I": 34, "P": 35,
+            "L": 37, "J": 38, "K": 40, "N": 45, "M": 46,
+            "return": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53,
+            "left": 123, "right": 124, "down": 125, "up": 126,
+        ]
+        guard let keyCode = keyCodes[name.lowercased()] ?? keyCodes[upper] else { return nil }
+        let values: [String]
+        if let modifiers {
+            guard let supplied = modifiers as? [String] else { return nil }
+            values = supplied
+        } else {
+            values = []
+        }
+        guard values.count == Set(values).count,
+              values.allSatisfy({ ["command", "control", "option", "shift"].contains($0) }) else { return nil }
+        var flags: UInt64 = 0
+        for modifier in values {
+            switch modifier {
+            case "command": flags |= 1 << 20
+            case "control": flags |= 1 << 18
+            case "option": flags |= 1 << 19
+            case "shift": flags |= 1 << 17
+            default: return nil
+            }
+        }
+        if name != name.lowercased() && name.count == 1 { flags |= 1 << 17 }
+        return ParsedKey(keyCode: keyCode, flags: flags)
+    }
+
+    private static func finiteNumber(_ value: Any?) -> Double? {
+        guard !isBooleanNumber(value) else { return nil }
+        if let number = value as? Double, number.isFinite { return number }
+        if let number = value as? Int { return Double(number) }
+        if let number = value as? NSNumber, number.doubleValue.isFinite { return number.doubleValue }
+        return nil
+    }
+
+    private func pixelCoordinate(
+        local: [Double],
+        window: ComputerUseNativeWindow,
+        observation: ComputerUseNativeHostObservation,
+        scope: PixelScope?
+    ) -> [Double]? {
+        guard observation.target == window.target,
+              observation.isOnScreen, !observation.isMinimized,
+              let scope,
+              let envelope = Self.decodePixelToken(observation.stateToken),
+              envelope.scope == scope,
+              scope.fullImageSize.count == 2,
+              scope.fullImageSize.allSatisfy({ $0 > 0 }),
+              scope.outputImageSize.allSatisfy({ $0 > 0 }),
+              local[0] >= 0, local[1] >= 0,
+              local[0] < Double(scope.outputImageSize[0]),
+              local[1] < Double(scope.outputImageSize[1]),
+              window.bounds.origin.x.isFinite, window.bounds.origin.y.isFinite,
+              window.bounds.width.isFinite, window.bounds.height.isFinite,
+              window.bounds.width > 0, window.bounds.height > 0 else { return nil }
+        let fullCoordinate: [Double]
+        if let region = scope.region, region.count == 4 {
+            fullCoordinate = [Double(region[0]) + local[0], Double(region[1]) + local[1]]
+        } else {
+            fullCoordinate = local
+        }
+        let scaleX = Double(scope.fullImageSize[0]) / window.bounds.width
+        let scaleY = Double(scope.fullImageSize[1]) / window.bounds.height
+        guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
+              fullCoordinate[0] >= 0, fullCoordinate[1] >= 0,
+              fullCoordinate[0] < Double(scope.fullImageSize[0]),
+              fullCoordinate[1] < Double(scope.fullImageSize[1]) else { return nil }
+        return [window.bounds.minX + fullCoordinate[0] / scaleX,
+                window.bounds.minY + fullCoordinate[1] / scaleY]
     }
 
     private static func isBooleanNumber(_ value: Any?) -> Bool {
@@ -1395,6 +1599,32 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         public static func axTargetAvailable(target: ComputerUseNativeHostTarget) -> Bool {
             AXIsProcessTrusted() && exactAXWindow(target: target) != nil
+        }
+
+        public static func restoreWindow(target: ComputerUseNativeHostTarget) -> Bool {
+            guard AXIsProcessTrusted(),
+                  let window = exactAXWindow(target: target),
+                  let app = NSRunningApplication(processIdentifier: target.pid) else { return false }
+            var minimizedValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedValue) == .success,
+                  let wasMinimized = minimizedValue as? NSNumber else { return false }
+            return NativeWindowRestoreSequence.run(
+                wasMinimized: wasMinimized.boolValue,
+                unminimize: {
+                    AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success
+                },
+                focusExactWindow: {
+                    AXUIElementSetAttributeValue(
+                        AXUIElementCreateApplication(target.pid),
+                        kAXFocusedWindowAttribute as CFString,
+                        window
+                    ) == .success
+                },
+                activateApp: { app.activate(options: []) },
+                rollbackMinimized: {
+                    _ = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+                }
+            )
         }
 
         static func quartzTitleUniquelyIdentifiesTarget(
@@ -1846,8 +2076,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 kCGNullWindowID
             ) as? [[String: Any]] ?? []
             for info in infos {
-                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
-                guard layer == 0,
+                let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+                guard alpha > 0,
                       let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
                       let windowID = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
                       let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
@@ -1869,7 +2099,35 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard let window = exactAXWindow(target: target) else {
                 return false
             }
-            return find(element: window, role: role, label: label)
+            guard let match = NativeSemanticTargetSearch.uniqueMatch(
+                root: window,
+                role: role,
+                label: label,
+                attributesOf: { element in
+                    func readString(_ key: String) -> (value: String?, readable: Bool) {
+                        var value: CFTypeRef?
+                        let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+                        if status == .attributeUnsupported { return (nil, true) }
+                        guard status == .success else { return (nil, false) }
+                        guard let value else { return (nil, true) }
+                        guard let string = value as? String else { return (nil, false) }
+                        return (string, true)
+                    }
+                    let role = readString(kAXRoleAttribute)
+                    let title = readString(kAXTitleAttribute)
+                    let description = readString(kAXDescriptionAttribute)
+                    guard role.readable, title.readable, description.readable else { return nil }
+                    return (role.value, title.value, description.value)
+                },
+                childrenOf: { element in
+                    var value: CFTypeRef?
+                    let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+                    if result == .attributeUnsupported { return [] }
+                    guard result == .success, let value else { return nil }
+                    return axElements(from: value)
+                }
+            ) else { return false }
+            return AXUIElementPerformAction(match, kAXPressAction as CFString) == .success
         }
 
         public static func uiTree(target: ComputerUseNativeHostTarget) -> String? {
@@ -1887,12 +2145,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public static func leftClick(
             target: ComputerUseNativeHostTarget,
             coordinate: [Double]
-        ) -> Bool {
-            guard AXIsProcessTrusted(), coordinate.count >= 2,
+        ) -> ComputerUseNativeClickResult {
+            guard AXIsProcessTrusted(), coordinate.count == 2,
                   let targetBounds = targetBounds(target),
                   let targetWindow = exactAXWindow(target: target),
                   targetBounds.contains(CGPoint(x: coordinate[0], y: coordinate[1])) else {
-                return false
+                return .failed
             }
             let app = AXUIElementCreateApplication(target.pid)
             var element: AXUIElement?
@@ -1905,9 +2163,24 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let element,
             let ownerWindow = elementAttribute(kAXWindowAttribute as CFString, from: element),
             sameAXWindow(ownerWindow, targetWindow) else {
-                return false
+                return .noAXTarget
             }
-            return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+            var actionNames: CFArray?
+            guard AXUIElementCopyActionNames(element, &actionNames) == .success,
+                  let actions = actionNames as? [String] else { return .failed }
+            guard actions.contains(kAXPressAction as String) else { return .noAXTarget }
+            return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success ? .applied : .failed
+        }
+
+        public static func focusedTarget(target: ComputerUseNativeHostTarget) -> Bool {
+            guard AXIsProcessTrusted(),
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid,
+                  let targetWindow = exactAXWindow(target: target),
+                  let focusedWindow = elementAttribute(
+                    kAXFocusedWindowAttribute as CFString,
+                    from: AXUIElementCreateApplication(target.pid)
+                  ) else { return false }
+            return sameAXWindow(focusedWindow, targetWindow)
         }
 
         public static func typeText(
@@ -1939,17 +2212,84 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             ) == .success
         }
 
+        static func markSyntheticInput(_ event: CGEvent) {
+            event.setIntegerValueField(
+                .eventSourceUserData,
+                value: ComputerUseNativeActivityMonitor.syntheticEventUserData
+            )
+        }
+
         public static func pixelAction(
             target: ComputerUseNativeHostTarget,
             name: String,
             coordinate: [Double]
         ) -> Bool {
-            // A Quartz event would move the user's physical pointer or steal
-            // focus. The native backend intentionally has no pixel injector.
-            _ = target
-            _ = name
-            _ = coordinate
-            return false
+            guard AXIsProcessTrusted(),
+                  let source = CGEventSource(stateID: .hidSystemState) else { return false }
+            if name == "key" {
+                guard coordinate.count == 2,
+                      coordinate[0].isFinite, coordinate[1].isFinite,
+                      coordinate[0] >= 0, coordinate[0] <= Double(UInt16.max),
+                      coordinate[1] >= 0, coordinate[1] <= Double(UInt32.max),
+                      focusedTarget(target: target) else { return false }
+                let keyCode = CGKeyCode(coordinate[0])
+                let flags = CGEventFlags(rawValue: UInt64(coordinate[1]))
+                guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+                      let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false),
+                      focusedTarget(target: target) else { return false }
+                down.flags = flags
+                up.flags = flags
+                markSyntheticInput(down)
+                markSyntheticInput(up)
+                down.post(tap: .cghidEventTap)
+                up.post(tap: .cghidEventTap)
+                return true
+            }
+            guard ["left_click", "right_click", "mouse_move", "scroll"].contains(name),
+                  coordinate.count == (name == "scroll" ? 4 : 2),
+                  coordinate.allSatisfy(\.isFinite),
+                  let window = listWindows(bundleID: nil).first(where: { $0.target == target }),
+                  window.isOnScreen, !window.isMinimized,
+                  let x = coordinate.first, let y = coordinate.dropFirst().first,
+                  window.bounds.contains(CGPoint(x: x, y: y)),
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid,
+                  focusedTarget(target: target),
+                  windowUnderPointer(CGPoint(x: x, y: y)) == target else { return false }
+            let point = CGPoint(x: x, y: y)
+            if name == "mouse_move" {
+                guard focusedTarget(target: target), windowUnderPointer(point) == target,
+                      let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                                          mouseCursorPosition: point, mouseButton: .left) else { return false }
+                markSyntheticInput(event)
+                event.post(tap: .cghidEventTap)
+                return true
+            }
+            if name == "scroll" {
+                guard abs(coordinate[2]) <= 10_000, abs(coordinate[3]) <= 10_000,
+                      let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                                          wheel1: Int32(coordinate[3]), wheel2: Int32(coordinate[2]), wheel3: 0) else { return false }
+                guard focusedTarget(target: target), windowUnderPointer(point) == target else { return false }
+                event.location = point
+                markSyntheticInput(event)
+                event.post(tap: .cghidEventTap)
+                return true
+            }
+            let right = name == "right_click"
+            let downType: CGEventType = right ? .rightMouseDown : .leftMouseDown
+            let upType: CGEventType = right ? .rightMouseUp : .leftMouseUp
+            let button: CGMouseButton = right ? .right : .left
+            guard let down = CGEvent(mouseEventSource: source, mouseType: downType,
+                                     mouseCursorPosition: point, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: source, mouseType: upType,
+                                   mouseCursorPosition: point, mouseButton: button),
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid,
+                  focusedTarget(target: target),
+                  windowUnderPointer(point) == target else { return false }
+            markSyntheticInput(down)
+            markSyntheticInput(up)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            return true
         }
 
         private static func attribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
@@ -2102,20 +2442,34 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return result
         }
 
-        private static func find(element: AXUIElement, role: String, label: String, depth: Int = 0) -> Bool {
-            guard depth < 32 else { return false }
+        private static func matchingElements(
+            element: AXUIElement,
+            role: String,
+            label: String,
+            depth: Int = 0
+        ) -> [AXUIElement] {
+            guard depth < 32 else { return [] }
             let actualRole = attribute(kAXRoleAttribute as CFString, from: element) as? String
             let title = attribute(kAXTitleAttribute as CFString, from: element) as? String
             let description = attribute(kAXDescriptionAttribute as CFString, from: element) as? String
-            if actualRole == role && (title == label || description == label),
-               AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
-                return true
+            var matches: [AXUIElement] = []
+            if actualRole == role && (title == label || description == label) {
+                matches.append(element)
             }
             guard let children = attribute(kAXChildrenAttribute as CFString, from: element)
                     .flatMap(axElements(from:)) else {
-                return false
+                return matches
             }
-            return children.contains { find(element: $0, role: role, label: label, depth: depth + 1) }
+            for child in children {
+                matches.append(contentsOf: matchingElements(
+                    element: child,
+                    role: role,
+                    label: label,
+                    depth: depth + 1
+                ))
+                if matches.count > 1 { return matches }
+            }
+            return matches
         }
     }
 }

@@ -9,14 +9,36 @@ let requests = Promise.resolve();
 // or exposing references to page scripts. Every action checks visibility again
 // inside the tab to close the race with the background service worker.
 export function pageOperation(operation, args) {
+  const elementVisible = element => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    for (let current = element; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+    }
+    return true;
+  };
+  const elementSignature = element => ({
+    role: element.getAttribute('role') || element.tagName.toLowerCase(),
+    name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
+    type: element.type || '',
+    disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+    readOnly: Boolean(element.readOnly),
+    href: element.getAttribute('href') || '',
+    value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
+  });
   if (document.visibilityState !== 'hidden') {
     throw new Error('human_activity: the tab is visible; select another tab before continuing.');
   }
   if (operation === 'browser_act') {
     const snapshot = globalThis.__macUseSnapshot;
-    const element = snapshot?.get(args.ref);
+    const entry = snapshot?.get(args.ref);
+    const element = entry?.element;
     if (args.action !== 'scroll' || args.ref) {
-      if (!element?.isConnected) throw new Error('stale_reference: take a new browser_snapshot.');
+      if (!element?.isConnected || !elementVisible(element)
+          || JSON.stringify(elementSignature(element)) !== JSON.stringify(entry.signature)) {
+        throw new Error('stale_reference: take a new browser_snapshot.');
+      }
     }
     if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) {
       throw new Error('The element is disabled.');
@@ -53,20 +75,12 @@ export function pageOperation(operation, args) {
   }
   const token = crypto.randomUUID();
   const refs = new Map();
-  const visible = element => {
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-  };
   const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable]'))
-    .filter(visible).slice(0, 200).map((element, index) => {
+    .filter(elementVisible).slice(0, 200).map((element, index) => {
       const ref = `${token}.${index}`;
-      refs.set(ref, element);
-      return {
-        ref, role: element.getAttribute('role') || element.tagName.toLowerCase(),
-        name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
-        value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
-      };
+      const signature = elementSignature(element);
+      refs.set(ref, {element, signature});
+      return {ref, role: signature.role, name: signature.name, value: signature.value};
     });
   globalThis.__macUseSnapshot = refs;
   return {url: location.href, title: document.title, ready: document.readyState === 'complete',

@@ -116,6 +116,11 @@ public struct ManagedComputerUseMCP: Sendable {
         leftClickTool,
         typeTool,
         "click_element",
+        "restore_window",
+        "right_click",
+        "mouse_move",
+        "scroll",
+        "key",
     ]
 
     public static var advertisedToolNames: [String] {
@@ -162,7 +167,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; when a task is complete, call browser_close for each tab opened by this session. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; when a task is complete, call browser_close for each tab opened by this session. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -245,9 +250,17 @@ public struct ManagedComputerUseMCP: Sendable {
         case "zoom":
             return "Return an exact integral pixel crop from the target window; crop coordinates and returned image coordinates use a top-left origin."
         case leftClickTool:
-            return "Press an AX element at pixel coordinates relative to a screenshot or zoom image in the exact target window; requires its state token and never activates or moves the pointer."
+            return "Click a screenshot pixel coordinate in the exact target window using Accessibility when hit-testable. If hit testing cannot identify an AX element, uses CGEvent only when that exact target window is already focused; requires a fresh screenshot state token."
         case typeTool:
             return "Type Unicode text into a settable AX-focused element in the exact background target."
+        case "right_click":
+            return "Right-click a screenshot pixel coordinate in the exact target window; requires a fresh screenshot state token and the exact target window must already be focused."
+        case "mouse_move":
+            return "Move the pointer to a screenshot pixel coordinate in the exact focused target window; requires a fresh screenshot state token."
+        case "scroll":
+            return "Scroll at a screenshot pixel coordinate in the exact focused target window using bounded delta_x and delta_y; requires a fresh screenshot state token."
+        case "key":
+            return "Send one allowlisted key with optional command/control/option/shift modifiers only while the exact target app and window are already focused; requires a fresh state token and never focuses or activates the target."
         case "cursor_position":
             return "Read the current pointer position."
         case "list_windows":
@@ -258,6 +271,8 @@ public struct ManagedComputerUseMCP: Sendable {
             return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED. Without a key, return unambiguous labeled candidates for the Distill session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "click_element":
             return "Press an AX element by role and label in the exact background target."
+        case "restore_window":
+            return "Explicitly restore and focus the exact PID/window; requires its fresh state token and returns a new observation. Use that new token for subsequent actions."
         case "browser_open":
             return "Open an HTTP(S) URL in a new background tab in the connected Chrome profile. Never navigate a tab selected by the user."
         case "browser_snapshot":
@@ -329,6 +344,38 @@ public struct ManagedComputerUseMCP: Sendable {
                     "label": ["type": "string"],
                 ]) { _, new in new },
                 "required": ["target_pid", "target_window_id", "expected_state_token", "role", "label"],
+            ]
+        case "right_click", "mouse_move":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "coordinate": ["type": "array", "description": "[x,y] pixels relative to the latest screenshot.", "items": ["type": "number"]],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "coordinate"],
+            ]
+        case "scroll":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "coordinate": ["type": "array", "description": "[x,y] pixels relative to the latest screenshot.", "items": ["type": "number"]],
+                    "delta_x": ["type": "number"], "delta_y": ["type": "number"],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "coordinate", "delta_x", "delta_y"],
+            ]
+        case "key":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "key": ["type": "string", "description": "One allowlisted single-character key or Return, Tab, Space, Delete, Escape, Left, Right, Up, Down."],
+                    "modifiers": ["type": "array", "items": ["type": "string", "enum": ["command", "control", "option", "shift"]]],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "key"],
+            ]
+        case "restore_window":
+            return [
+                "type": "object",
+                "properties": targeting,
+                "required": ["target_pid", "target_window_id", "expected_state_token"],
             ]
         case "list_windows":
             return [
