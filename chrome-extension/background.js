@@ -94,9 +94,16 @@ export async function handleRequest(request) {
   if (typeof session !== 'string' || !/^[a-f0-9-]{36}$/i.test(session)) throw new Error('Invalid browser session.');
   if (operation === 'browser_status') return {connected: true, mode: 'current_chrome_profile', hasTab: sessions.has(session)};
   if (operation === 'browser_close') {
-    if (!sessions.has(session)) return {closed: false, released: false};
-    // Chrome has no conditional remove-if-inactive API. Leave the tab to the user.
+    const entry = sessions.get(session);
+    if (!entry) return {closed: false, released: false};
     sessions.delete(session);
+    try {
+      const tab = await chrome.tabs.get(entry.tabId);
+      if (!entry.takenOver && !tab.active) {
+        await chrome.tabs.remove(entry.tabId);
+        return {closed: true, released: true};
+      }
+    } catch {}
     return {closed: false, released: true};
   }
   if (operation === 'browser_open') {
