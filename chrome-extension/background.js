@@ -94,9 +94,25 @@ export async function handleRequest(request) {
   if (typeof session !== 'string' || !/^[a-f0-9-]{36}$/i.test(session)) throw new Error('Invalid browser session.');
   if (operation === 'browser_status') return {connected: true, mode: 'current_chrome_profile', hasTab: sessions.has(session)};
   if (operation === 'browser_close') {
-    if (!sessions.has(session)) return {closed: false, released: false};
+    const entry = sessions.get(session);
+    if (!entry) return {closed: false, released: false};
+    let tab;
+    try { tab = await chrome.tabs.get(entry.tabId); }
+    catch {
+      sessions.delete(session);
+      return {closed: false, released: true};
+    }
+    if (entry.takenOver || tab.active) {
+      sessions.delete(session);
+      return {closed: false, released: true};
+    }
     sessions.delete(session);
-    return {closed: false, released: true};
+    try {
+      await chrome.tabs.remove(entry.tabId);
+      return {closed: true, released: true};
+    } catch {
+      return {closed: false, released: true};
+    }
   }
   if (operation === 'browser_open') {
     const url = validURL(args.url);

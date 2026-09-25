@@ -100,7 +100,7 @@ The extension's native host registration is missing or does not match the extens
 
 ### Privacy and control
 
-The Chrome extension can read page text and form values, except password values. It can click, fill, type, and scroll in tabs that it opened. It does not automate your selected tab; selecting an automated tab gives control back to you. Page content and snapshots are visible to your Distill session, so do not use the browser tools on pages containing information you do not want to share with that session. The extension requests access to HTTP and HTTPS sites because it needs to operate on pages you ask it to open.
+The Chrome extension can read page text and form values, except password values. It can click, fill, type, and scroll in tabs that it opened. It does not automate your selected tab; selecting an automated tab gives control back to you. When `browser_close` runs or the extension disconnects, it best-effort closes only tabs it created that still appear inactive and were not selected by the user. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Page content and snapshots are visible to your Distill session, so do not use the browser tools on pages containing information you do not want to share with that session. The extension requests access to HTTP and HTTPS sites because it needs to operate on pages you ask it to open.
 
 ---
 
@@ -198,7 +198,7 @@ Falta el registro del host nativo o el ID registrado no coincide con el de la ex
 
 ### Privacidad y control
 
-La extensión de Chrome puede leer el texto de las páginas y los valores de los formularios, excepto las contraseñas. Puede hacer clic, rellenar campos, escribir y desplazarse en las pestañas que abrió. No controla la pestaña seleccionada; si seleccionas una pestaña automatizada, recuperas el control. El contenido y las capturas de las páginas quedan visibles para tu sesión de Distill. No uses estas herramientas en páginas con información que no quieras compartir con esa sesión. La extensión solicita acceso a sitios HTTP y HTTPS para poder trabajar en las páginas que le pidas abrir.
+La extensión de Chrome puede leer el texto de las páginas y los valores de los formularios, excepto las contraseñas. Puede hacer clic, rellenar campos, escribir y desplazarse en las pestañas que abrió. No controla la pestaña seleccionada; si seleccionas una pestaña automatizada, recuperas el control. Al ejecutar `browser_close` o desconectarse la extensión, intenta cerrar únicamente las pestañas que creó y que siguen inactivas y no fueron seleccionadas por el usuario. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña; por eso, una selección que coincida con la eliminación todavía podría cerrarse. El contenido y las capturas de las páginas quedan visibles para tu sesión de Distill. No uses estas herramientas en páginas con información que no quieras compartir con esa sesión. La extensión solicita acceso a sitios HTTP y HTTPS para poder trabajar en las páginas que le pidas abrir.
 
 ---
 
@@ -296,4 +296,4 @@ O registro do host nativo está ausente ou não corresponde ao ID da extensão. 
 
 ### Privacidade e controle
 
-A extensão do Chrome pode ler o texto das páginas e os valores dos formulários, exceto senhas. Ela pode clicar, preencher campos, digitar e rolar em abas que abriu. Ela não controla a aba selecionada; ao selecionar uma aba automatizada, você retoma o controle. O conteúdo e as capturas das páginas ficam visíveis para a sessão do Distill. Não use essas ferramentas em páginas com informações que você não queira compartilhar com essa sessão. A extensão solicita acesso a sites HTTP e HTTPS para poder operar nas páginas que você pedir para abrir.
+A extensão do Chrome pode ler o texto das páginas e os valores dos formulários, exceto senhas. Ela pode clicar, preencher campos, digitar e rolar em abas que abriu. Ela não controla a aba selecionada; ao selecionar uma aba automatizada, você retoma o controle. Quando `browser_close` é chamado ou a extensão se desconecta, ela tenta fechar somente as abas que criou e que ainda aparentam estar inativas e não terem sido selecionadas pelo usuário. O Chrome não torna atômicas a verificação de atividade e a remoção da aba; portanto, uma seleção que coincida com a remoção ainda pode resultar no fechamento. O conteúdo e as capturas das páginas ficam visíveis para a sessão do Distill. Não use essas ferramentas em páginas com informações que você não queira compartilhar com essa sessão. A extensão solicita acesso a sites HTTP e HTTPS para poder operar nas páginas que você pedir para abrir.
