@@ -78,10 +78,10 @@ test('activation while a snapshot is in flight prevents the result from being re
 });
 
 
-test('browser_close removes a session-owned tab only while it remains inactive', async () => {
+test('browser_close releases the session without closing the Chrome tab', async () => {
   const fourth = '00000000-0000-0000-0000-000000000004';
   await handleRequest({operation: 'browser_open', session: fourth, arguments: {url: 'https://example.com/'}});
   const result = await handleRequest({operation: 'browser_close', session: fourth});
-  assert.deepEqual(result, {closed: true, released: true});
-  assert.equal(removed, true);
+  assert.deepEqual(result, {closed: false, released: true});
+  assert.equal(removed, false);
 });

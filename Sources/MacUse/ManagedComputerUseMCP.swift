@@ -162,7 +162,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; when a task is complete, call browser_close for each tab opened by this session. It closes a tab only if it remains inactive and has not been selected by the user; otherwise it releases control and leaves the tab open. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "mac-use controls exact macOS windows without activating them. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; when a task is complete, call browser_close for each tab opened by this session to release control. This does not close the Chrome tab; close it manually if you no longer need it. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -265,7 +265,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "browser_act":
             return "Click, fill, type or scroll in the owned background tab using a fresh snapshot ref. Fails if the user selects the tab; confirm consequential actions."
         case "browser_close":
-            return "Close this session's Chrome tab if it is still inactive and has not been selected by the user; otherwise release it without closing it."
+            return "Release this browser session without closing the Chrome tab. Close the tab manually if it is no longer needed."
         case "browser_status":
             return "Check whether the separate Chrome extension is connected."
         case "doctor":
