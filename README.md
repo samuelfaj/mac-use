@@ -62,6 +62,19 @@ Run **one** command for the client you use, from inside the `mac-use` folder:
 
 If the client was already open, restart it after adding the server. In Claude Code, approve the server if prompted. Keep the repository at the same path; each client starts the executable from there.
 
+### Install the agent skill globally
+
+Install the bundled [mac-use skill](skills/mac-use/SKILL.md) from this repository for Codex, Claude Code, and Distill/Grok Build (which share `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/mac-use"
+  cp "skills/mac-use/SKILL.md" "$root/mac-use/SKILL.md"
+done
+```
+
+Start a new client session after installation. The skill requires agents to close resources they create, including after failures, preserve user-owned resources, and verify cleanup. The MCP also advertises a cleanup reminder. This is agent guidance, not an automatic sandbox; the shared Chrome profile retains normal history and site state.
+
 ### 3. Allow macOS access for native windows
 
 When macOS asks, allow **Accessibility** and **Screen Recording** for the app that runs your MCP client. These permissions are needed only for native macOS windows. You can use the MCP `doctor` tool on a window to check permissions.
@@ -160,6 +173,19 @@ Ejecuta **un solo** comando, según el cliente que uses, desde la carpeta `mac-u
 
 Si el cliente ya estaba abierto, reinícialo después de añadir el servidor. En Claude Code, acepta el servidor si aparece una solicitud. Conserva el repositorio en la misma ruta; cada cliente inicia el ejecutable desde allí.
 
+### Instalar la skill del agente globalmente
+
+Instala la [skill mac-use](skills/mac-use/SKILL.md) incluida en este repositorio para Codex, Claude Code y Distill/Grok Build (que comparten `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/mac-use"
+  cp "skills/mac-use/SKILL.md" "$root/mac-use/SKILL.md"
+done
+```
+
+Inicia una sesión nueva del cliente después de instalarla. La skill exige cerrar los recursos creados por el agente incluso ante errores, preservar los recursos del usuario y verificar la limpieza. El MCP también comunica un recordatorio. Son instrucciones para el agente, no un entorno aislado automático; el perfil compartido de Chrome conserva su historial y los datos de los sitios.
+
 ### 3. Permitir el acceso de macOS a las ventanas nativas
 
 Cuando macOS lo solicite, permite **Accesibilidad** y **Grabación de pantalla** para la aplicación que ejecuta tu cliente MCP. Estos permisos solo hacen falta para controlar ventanas nativas de macOS. Puedes usar la herramienta MCP `doctor` sobre una ventana para comprobar los permisos.
@@ -257,6 +283,19 @@ Execute **apenas um** comando, de acordo com o cliente que você usa, dentro da 
   ```
 
 Se o cliente já estiver aberto, reinicie-o depois de adicionar o servidor. No Claude Code, aprove o servidor se aparecer uma solicitação. Mantenha o repositório no mesmo caminho; cada cliente inicia o executável a partir dele.
+
+### Instale a skill do agente globalmente
+
+Instale a [skill mac-use](skills/mac-use/SKILL.md) incluída neste repositório para Codex, Claude Code e Distill/Grok Build (que compartilham `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/mac-use"
+  cp "skills/mac-use/SKILL.md" "$root/mac-use/SKILL.md"
+done
+```
+
+Inicie uma nova sessão do cliente após instalar. A skill exige fechar os recursos criados pelo agente inclusive em caso de erro, preservar os recursos do usuário e verificar a limpeza. O MCP também fornece um lembrete. São instruções para o agente, não um isolamento automático; o perfil compartilhado do Chrome mantém histórico e dados dos sites.
 
 ### 3. Permita o acesso do macOS às janelas nativas
 
