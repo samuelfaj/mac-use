@@ -20,8 +20,14 @@ const removedTabIds = [];
 const activated = makeEvent();
 const removed = makeEvent();
 const installed = makeEvent();
+const updated = makeEvent();
 let connection;
 const noopEvent = makeEvent();
+const groupCalls = [];
+const groupUpdateCalls = [];
+let groupQueryResult = [];
+let groupThrow = false;
+let nextGroupId = 100;
 
 globalThis.chrome = {
   runtime: {
@@ -37,9 +43,16 @@ globalThis.chrome = {
   tabs: {
     onActivated: activated,
     onRemoved: removed,
+    onUpdated: updated,
+    async group({groupId, tabIds, createProperties}) {
+      if (groupThrow) throw new Error('group failed');
+      groupCalls.push({groupId, tabIds, createProperties});
+      if (groupId !== undefined) return groupId;
+      return nextGroupId++;
+    },
     async create({active: requestedActive, url}) {
       assert.equal(requestedActive, false);
-      const tab = {id: nextTabId++, active: false, status: 'complete', url};
+      const tab = {id: nextTabId++, active: false, status: 'complete', url, windowId: 1};
       currentTabId = tab.id;
       tabs.set(tab.id, tab);
       if (activatedDuringCreation) activated.fire({tabId: tab.id});
@@ -66,6 +79,13 @@ globalThis.chrome = {
     },
   },
   windows: {async getLastFocused() { return {id: 1, incognito: false}; }},
+  tabGroups: {
+    async query({windowId, title}) {
+      assert.equal(title, 'mac-use');
+      return groupQueryResult.filter(g => windowId === undefined || g.windowId === windowId);
+    },
+    async update(groupId, changes) { groupUpdateCalls.push({groupId, changes}); return {id: groupId, ...changes}; },
+  },
   scripting: {async executeScript() {
     if (activateOnScript) activated.fire({tabId: currentTabId});
     return [{result: {url: tabs.get(currentTabId).url, elements: []}}];
@@ -201,5 +221,41 @@ test('activation while a snapshot is in flight prevents the result from being re
   activateOnScript = true;
   await assert.rejects(handleRequest({operation: 'browser_snapshot', session}), /human_activity/);
   activateOnScript = false;
+  await handleRequest({operation: 'browser_close', session});
+});
+
+test('browser_open groups tabs in a collapsed mac-use group', async () => {
+  groupQueryResult = [];
+  groupCalls.length = 0;
+  groupUpdateCalls.length = 0;
+  const first = await openSession(11);
+  assert.equal(groupUpdateCalls.length, 1);
+  assert.deepEqual(groupUpdateCalls[0].changes, {title: 'mac-use', color: 'grey', collapsed: true});
+  const groupId = groupUpdateCalls[0].groupId;
+  groupQueryResult = [{id: groupId, windowId: 1, title: 'mac-use'}];
+  const collapsedUpdates = groupUpdateCalls.length;
+  const second = await openSession(12);
+  assert.equal(groupCalls[groupCalls.length - 1].groupId, groupId);
+  assert.deepEqual(groupCalls[groupCalls.length - 1].tabIds, [second.tabId]);
+  assert.equal(groupUpdateCalls.length, collapsedUpdates);
+  await handleRequest({operation: 'browser_close', session: first.session});
+  await handleRequest({operation: 'browser_close', session: second.session});
+  groupQueryResult = [];
+});
+
+test('moving a tab out of the group transfers ownership to the user', async () => {
+  groupQueryResult = [];
+  const {session, tabId} = await openSession(13);
+  updated.fire(tabId, {groupId: -1});
+  await assert.rejects(handleRequest({operation: 'browser_snapshot', session}), /human_activity/);
+  await handleRequest({operation: 'browser_close', session});
+  groupQueryResult = [];
+});
+
+test('grouping failure still lets browser_open succeed', async () => {
+  groupThrow = true;
+  const {session} = await openSession(14);
+  groupThrow = false;
+  await handleRequest({operation: 'browser_snapshot', session});
   await handleRequest({operation: 'browser_close', session});
 });

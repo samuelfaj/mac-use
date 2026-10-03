@@ -16,7 +16,7 @@ Complete the requested task and leave no unrequested resources or changes behind
 
 ## Chrome: open, use, close, verify
 
-Use the browser tools for HTTP(S) work through the connected Chrome extension. They operate on one owned background tab per MCP server session; they do not accept arbitrary tab IDs.
+Use the browser tools for HTTP(S) work through the connected Chrome extension. They operate on one owned background tab per MCP server session; they do not accept arbitrary tab IDs. Tabs opened by mac-use are placed in a collapsed "mac-use" tab group; moving a tab out of the group or selecting it gives control back to the user.
 
 1. Call `browser_status` with `{}`. Require `connected: true`. If `hasTab: true`, reconcile it with this task's tracked resources before using or releasing it; do not close an unfamiliar session's work.
 2. Call `browser_open` with `{"url":"https://example.com"}`. Record the cleanup obligation as soon as you attempt creation: an error or timeout can occur after a tab was created. Do not open another until this session's previous tab is released.

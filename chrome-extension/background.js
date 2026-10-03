@@ -87,6 +87,16 @@ export function pageOperation(operation, args) {
     text: (document.body?.innerText || '').slice(0, 16000), elements};
 }
 
+async function groupTab(tab) {
+  const [existing] = await chrome.tabGroups.query({windowId: tab.windowId, title: 'mac-use'});
+  if (existing) {
+    return chrome.tabs.group({groupId: existing.id, tabIds: [tab.id]});
+  }
+  const groupId = await chrome.tabs.group({tabIds: [tab.id], createProperties: {windowId: tab.windowId}});
+  await chrome.tabGroups.update(groupId, {title: 'mac-use', color: 'grey', collapsed: true});
+  return groupId;
+}
+
 async function ownedTab(session) {
   const entry = sessions.get(session);
   if (!entry) throw new Error('No owned tab. Use browser_open first.');
@@ -142,7 +152,11 @@ export async function handleRequest(request) {
     finally { creatingTab = false; }
     sessions.set(session, {tabId: tab.id, takenOver: tab.active || activatedDuringCreation.has(tab.id)});
     activatedDuringCreation.clear();
-    if (!tab.active && !sessions.get(session)?.takenOver) await chrome.tabs.update(tab.id, {muted: true});
+    if (!tab.active && !sessions.get(session)?.takenOver) {
+      await chrome.tabs.update(tab.id, {muted: true});
+      // Grouping is cosmetic; a failure must not fail browser_open.
+      try { sessions.get(session).groupId = await groupTab(tab); } catch {}
+    }
     return {url, loading: true, next: 'Use browser_snapshot to read the page after navigation.'};
   }
   if (!['browser_snapshot', 'browser_act'].includes(operation)) throw new Error('Unknown browser operation.');
@@ -207,6 +221,14 @@ chrome.tabs.onActivated.addListener(({tabId}) => {
 });
 chrome.tabs.onRemoved.addListener(tabId => {
   for (const [session, entry] of sessions) if (entry.tabId === tabId) sessions.delete(session);
+});
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.groupId === undefined) return;
+  for (const entry of sessions.values()) {
+    if (entry.tabId === tabId && entry.groupId !== undefined && changeInfo.groupId !== entry.groupId) {
+      entry.takenOver = true;
+    }
+  }
 });
 chrome.action.onClicked.addListener(() => {
   if (port) {

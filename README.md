@@ -10,7 +10,7 @@ A macOS 14+ MCP server for controlling native macOS windows through Accessibilit
 
 ### Why use mac-use?
 
-mac-use is designed to work alongside your normal Mac use and compatible computer-use tools. For native windows, it acts through Accessibility on the exact window you choose, without activating that window or moving your physical pointer. It waits for recent keyboard or mouse activity to settle and stops if you take over. Its shared lock serializes actions with other computer-use tools that honor the same lock, including RemoteCode. Tools that do not use that lock cannot be guaranteed conflict-free. In Chrome, mac-use opens background tabs and stops controlling a tab as soon as you select it.
+mac-use is designed to work alongside your normal Mac use and compatible computer-use tools. For native windows, it acts through Accessibility on the exact window you choose, without activating that window or moving your physical pointer. It waits for recent keyboard or mouse activity to settle and stops if you take over. Its shared lock serializes actions with other computer-use tools that honor the same lock, including RemoteCode. Tools that do not use that lock cannot be guaranteed conflict-free. In Chrome, mac-use opens background tabs and stops controlling a tab as soon as you select it. Tabs it opens are placed in a collapsed "mac-use" tab group; moving a tab out of the group or selecting it gives control back to you.
 
 ### What you need
 
@@ -103,7 +103,7 @@ The extension uses Chrome's native messaging to connect to the MCP server. If yo
 ### Try it
 
 - For a native window, call `list_windows`, then use the returned exact window details with the relevant mac-use tools.
-- For Chrome, call `browser_status`, then `browser_open` with an `http://` or `https://` address. It opens a new background tab. Use `browser_snapshot` to inspect it and `browser_act` for supported page actions.
+- For Chrome, call `browser_status`, then `browser_open` with an `http://` or `https://` address. It opens a new background tab. Tabs opened by mac-use are placed in a collapsed "mac-use" tab group; moving a tab out of the group or selecting it gives control back to you. Use `browser_snapshot` to inspect it and `browser_act` for supported page actions.
 
 `distill mcp doctor` checks that the MCP server starts and exposes its tools. It does not confirm macOS permissions or a Chrome connection.
 
@@ -222,7 +222,7 @@ La extensión usa la mensajería nativa de Chrome para conectarse al servidor MC
 ### Pruébalo
 
 - Para una ventana nativa, llama a `list_windows` y usa los datos exactos de la ventana con las herramientas correspondientes de mac-use.
-- Para Chrome, llama a `browser_status` y después a `browser_open` con una dirección `http://` o `https://`. Se abrirá una pestaña nueva en segundo plano. Usa `browser_snapshot` para verla y `browser_act` para realizar las acciones disponibles.
+- Para Chrome, llama a `browser_status` y después a `browser_open` con una dirección `http://` o `https://`. Se abrirá una pestaña nueva en segundo plano. Las pestañas abiertas por mac-use se colocan en un grupo de pestañas contraído llamado "mac-use"; mover una pestaña fuera del grupo o seleccionarla te devuelve el control. Usa `browser_snapshot` para verla y `browser_act` para realizar las acciones disponibles.
 
 `distill mcp doctor` comprueba que el servidor MCP se inicia y ofrece sus herramientas. No comprueba los permisos de macOS ni la conexión con Chrome.
 
@@ -341,7 +341,7 @@ A extensão usa o sistema de mensagens nativas do Chrome para se conectar ao ser
 ### Teste
 
 - Para uma janela nativa, chame `list_windows` e use os dados exatos da janela com as ferramentas correspondentes do mac-use.
-- Para o Chrome, chame `browser_status` e depois `browser_open` com um endereço `http://` ou `https://`. Uma nova aba será aberta em segundo plano. Use `browser_snapshot` para conferir a página e `browser_act` para executar as ações disponíveis.
+- Para o Chrome, chame `browser_status` e depois `browser_open` com um endereço `http://` ou `https://`. Uma nova aba será aberta em segundo plano. As abas abertas pelo mac-use são colocadas em um grupo de abas recolhido chamado "mac-use"; mover uma aba para fora do grupo ou selecioná-la devolve o controle a você. Use `browser_snapshot` para conferir a página e `browser_act` para executar as ações disponíveis.
 
 `distill mcp doctor` verifica se o servidor MCP inicia e disponibiliza as ferramentas. Ele não verifica as permissões do macOS nem a conexão com o Chrome.
 
