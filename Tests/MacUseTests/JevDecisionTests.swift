@@ -171,6 +171,22 @@ final class JevDecisionTests: XCTestCase {
         XCTAssertEqual(result.operation, "BLOCKED")
     }
 
+    func testJevAdviceCarriesAlternativesSignalsAndBlockReasonForSessionLLM() async throws {
+        // "Send" is material by label, so 0.70 is below the material threshold.
+        let transport = TestJev(probability: 0.70, confidence: 0.8, consequential: 0, authorization: 0.99)
+        let json = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation).jsonObject()
+        XCTAssertEqual(json["mode"] as? String, "jev")
+        XCTAssertEqual(json["operation"] as? String, "BLOCKED")
+        // A blocked choice must explain why, so the session LLM asks the user instead of guessing.
+        XCTAssertEqual(json["reason"] as? String, "Choice below material confidence threshold")
+        XCTAssertEqual((json["signals"] as? [String: Double])?["authorized"], 0.99)
+        // The runner-up (TestJev puts the remainder on the first other option) is surfaced as evidence.
+        let alternatives = try XCTUnwrap(json["alternatives"] as? [[String: Any]])
+        XCTAssertEqual(alternatives.count, 1)
+        XCTAssertEqual(alternatives[0]["operation"] as? String, "BLOCKED")
+        XCTAssertEqual(alternatives[0]["probability"] as? Double ?? 0, 0.30, accuracy: 1e-9)
+    }
+
     func testDoneNeedsIndependentCompletionEvidence() async throws {
         let transport = TestJev(selected: "DONE", completion: 0.5)
         let result = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation)

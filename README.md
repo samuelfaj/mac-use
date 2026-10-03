@@ -107,6 +107,14 @@ The extension uses Chrome's native messaging to connect to the MCP server. If yo
 
 `distill mcp doctor` checks that the MCP server starts and exposes its tools. It does not confirm macOS permissions or a Chrome connection.
 
+### Optional: use cua Spaces when available
+
+If the [cua](https://github.com/trycua/cua) CLI is installed (`curl -fsSL https://cua.ai/install.sh | sh`, then `cua auth login`), the read-only `cua_status` tool lists your [cua Spaces](https://spaces.cua.ai/). Agents should prefer a Space, through the `cua` MCP server, for work that does not need your own apps, files or signed-in sessions, so your Mac stays untouched. mac-use itself only detects Spaces; it does not control them. If `cua` is outside the MCP client's `PATH`, set `CUA_BIN` to its full path.
+
+### Jev and the session LLM
+
+`jev_decide` suggests one step. With `JEV_API_KEY`, `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`, Jev answers and the reply also includes up to three runner-up `alternatives`, its `signals` (`complete`, `consequential`, `authorized`) and a `reason` when it returns `BLOCKED`, so your session LLM can check the advice or ask you. Without a key, it returns safe candidates for the session LLM to choose from. If a configured Jev call fails, the tool returns an error instead of switching silently. Neither path clicks anything.
+
 ### If Chrome says "Specified native messaging host not found"
 
 The extension's native host registration is missing or does not match the extension ID. From the `mac-use` folder, run the registration command again with the current ID from `chrome://extensions`. Then click the extension icon to reconnect. Check that `.build/release/mac-use-mcp` is still at the same path and that the extension is loaded in the Chrome profile you are using.
@@ -218,6 +226,14 @@ La extensión usa la mensajería nativa de Chrome para conectarse al servidor MC
 
 `distill mcp doctor` comprueba que el servidor MCP se inicia y ofrece sus herramientas. No comprueba los permisos de macOS ni la conexión con Chrome.
 
+### Opcional: usar cua Spaces cuando estén disponibles
+
+Si la CLI de [cua](https://github.com/trycua/cua) está instalada (`curl -fsSL https://cua.ai/install.sh | sh` y luego `cua auth login`), la herramienta de solo lectura `cua_status` lista tus [cua Spaces](https://spaces.cua.ai/). Los agentes deben preferir un Space, mediante el servidor MCP `cua`, para tareas que no necesiten tus propias apps, archivos o sesiones iniciadas, así tu Mac no se toca. mac-use solo detecta los Spaces; no los controla. Si `cua` no está en el `PATH` del cliente MCP, define `CUA_BIN` con su ruta completa.
+
+### Jev y el LLM de la sesión
+
+`jev_decide` sugiere un paso. Con `JEV_API_KEY`, `TYPESAFE_API_KEY` u `OPENROUTER_API_KEY`, Jev responde y la respuesta también incluye hasta tres `alternatives`, sus `signals` (`complete`, `consequential`, `authorized`) y un `reason` cuando devuelve `BLOCKED`, para que el LLM de tu sesión revise la sugerencia o te pregunte. Sin clave, devuelve candidatos seguros para que el LLM de la sesión elija. Si una llamada a Jev configurado falla, la herramienta devuelve un error en lugar de cambiar en silencio. Ninguna de las dos opciones hace clic.
+
 ### Si Chrome muestra "Specified native messaging host not found"
 
 Falta el registro del host nativo o el ID registrado no coincide con el de la extensión. Desde la carpeta `mac-use`, ejecuta de nuevo el comando de registro con el ID actual de `chrome://extensions`. Después, haz clic en el icono de la extensión para conectarla. Comprueba que `.build/release/mac-use-mcp` siga en la misma ruta y que la extensión esté cargada en el perfil de Chrome que estás usando.
@@ -328,6 +344,14 @@ A extensão usa o sistema de mensagens nativas do Chrome para se conectar ao ser
 - Para o Chrome, chame `browser_status` e depois `browser_open` com um endereço `http://` ou `https://`. Uma nova aba será aberta em segundo plano. Use `browser_snapshot` para conferir a página e `browser_act` para executar as ações disponíveis.
 
 `distill mcp doctor` verifica se o servidor MCP inicia e disponibiliza as ferramentas. Ele não verifica as permissões do macOS nem a conexão com o Chrome.
+
+### Opcional: use cua Spaces quando disponível
+
+Se a CLI do [cua](https://github.com/trycua/cua) estiver instalada (`curl -fsSL https://cua.ai/install.sh | sh` e depois `cua auth login`), a ferramenta somente leitura `cua_status` lista seus [cua Spaces](https://spaces.cua.ai/). Os agentes devem preferir um Space, pelo servidor MCP `cua`, para tarefas que não precisam dos seus próprios apps, arquivos ou sessões logadas, assim seu Mac não é mexido. O mac-use apenas detecta os Spaces; ele não os controla. Se o `cua` estiver fora do `PATH` do cliente MCP, defina `CUA_BIN` com o caminho completo.
+
+### Jev e o LLM da sessão
+
+`jev_decide` sugere um passo. Com `JEV_API_KEY`, `TYPESAFE_API_KEY` ou `OPENROUTER_API_KEY`, o Jev responde e a resposta também traz até três `alternatives`, seus `signals` (`complete`, `consequential`, `authorized`) e um `reason` quando retorna `BLOCKED`, para o LLM da sessão conferir a sugestão ou perguntar a você. Sem chave, retorna candidatos seguros para o LLM da sessão escolher. Se uma chamada ao Jev configurado falhar, a ferramenta retorna erro em vez de trocar em silêncio. Nenhum dos dois caminhos clica em nada.
 
 ### Se o Chrome mostrar "Specified native messaging host not found"
 

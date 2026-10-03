@@ -110,6 +110,7 @@ public struct ManagedComputerUseMCP: Sendable {
         "get_ui_tree",
         "jev_decide",
         "doctor",
+        "cua_status",
     ]
 
     public static let mutationTools: [String] = [
@@ -132,6 +133,7 @@ public struct ManagedComputerUseMCP: Sendable {
     private let jev: JevDecision
     private let browser: any ComputerUseToolBackend
     private let jevAvailable: @Sendable () -> Bool
+    private let cua: CuaSpaces
 
     public init(
         queue: ComputerUseHostQueue = .shared,
@@ -140,13 +142,15 @@ public struct ManagedComputerUseMCP: Sendable {
         browser: any ComputerUseToolBackend = ChromeProfileComputerUseBackend(),
         jevAvailable: @escaping @Sendable () -> Bool = {
             TypeSafeJevTransport.isConfigured()
-        }
+        },
+        cua: CuaSpaces = CuaSpaces()
     ) {
         self.queue = queue
         self.backend = backend
         self.jev = jev
         self.browser = browser
         self.jevAvailable = jevAvailable
+        self.cua = cua
     }
 
     public func handle(_ line: String) async -> String? {
@@ -167,7 +171,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the Distill session LLM to decide. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -181,6 +185,10 @@ public struct ManagedComputerUseMCP: Sendable {
             if ChromeProfileComputerUseBackend.tools.contains(name) {
                 let result = await browser.invoke(name: name, arguments: arguments)
                 return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
+            }
+            if name == "cua_status" {
+                let result = ComputerUseToolResult(text: encode(cua.status()) ?? "{}")
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": false])
             }
             let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
             let targetPID = Self.targetPID(from: arguments)
@@ -268,7 +276,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "get_ui_tree":
             return "Accessibility tree for a window. Contains private screen text; use jev_decide for redacted Jev guidance."
         case "jev_decide":
-            return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED. Without a key, return unambiguous labeled candidates for the Distill session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
+            return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "click_element":
             return "Press an AX element by role and label in the exact background target."
         case "restore_window":
@@ -285,6 +293,8 @@ public struct ManagedComputerUseMCP: Sendable {
             return "Check whether the separate Chrome extension is connected."
         case "doctor":
             return "Permission and native-backend diagnostics."
+        case "cua_status":
+            return "Read-only: report whether the cua CLI is installed and which cua Spaces are registered. When available, prefer a Space via the cua MCP server for tasks that do not need the user's real apps or sessions."
         default:
             return name
         }
@@ -306,7 +316,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "ref": ["type": "string"], "text": ["type": "string"],
                 "delta_x": ["type": "number"], "delta_y": ["type": "number"],
             ], "required": ["action"]]
-        case "browser_snapshot", "browser_close", "browser_status":
+        case "browser_snapshot", "browser_close", "browser_status", "cua_status":
             return ["type": "object", "properties": [String: Any]()]
         case screenshotTool:
             return [

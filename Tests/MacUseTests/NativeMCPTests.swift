@@ -160,7 +160,7 @@ final class NativeMCPTests: XCTestCase {
         let result = try XCTUnwrap(message["result"] as? [String: Any])
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
         XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), Set([
-            "screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor",
+            "screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "cua_status",
             "left_click", "type", "click_element", "restore_window", "right_click", "mouse_move", "scroll", "key",
             "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status",
         ]))

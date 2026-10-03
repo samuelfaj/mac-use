@@ -83,9 +83,31 @@ public struct JevDecision: Sendable {
         public let label: String?
         public let probability: Double
         public let confidence: Double
+        public var reason: String? = nil
+        /// Runner-up options for the session LLM; advisory only, never authorization.
+        public var alternatives: [Alternative] = []
+        /// Jev's complete/consequential/authorized estimates for the chosen option.
+        public var signals: [String: Double] = [:]
 
         public func jsonObject() -> [String: Any] {
-            var result: [String: Any] = ["operation": operation, "probability": probability, "confidence": confidence]
+            var result: [String: Any] = ["mode": "jev", "operation": operation, "probability": probability, "confidence": confidence]
+            if let role { result["role"] = role }
+            if let label { result["label"] = label }
+            if let reason { result["reason"] = reason }
+            if !alternatives.isEmpty { result["alternatives"] = alternatives.map { $0.jsonObject() } }
+            if !signals.isEmpty { result["signals"] = signals }
+            return result
+        }
+    }
+
+    public struct Alternative: Sendable, Equatable {
+        public let operation: String
+        public let role: String?
+        public let label: String?
+        public let probability: Double
+
+        public func jsonObject() -> [String: Any] {
+            var result: [String: Any] = ["operation": operation, "probability": probability]
             if let role { result["role"] = role }
             if let label { result["label"] = label }
             return result
@@ -182,10 +204,25 @@ public struct JevDecision: Sendable {
               probability == probabilities.values.max() else {
             throw JevDecisionError.invalidResponse
         }
-        if choice == "BLOCKED" { return Proposal(operation: "BLOCKED", role: nil, label: nil, probability: probability, confidence: confidence) }
-        if choice == "WAIT" { return Proposal(operation: "WAIT", role: nil, label: nil, probability: probability, confidence: confidence) }
+        let alternatives = probabilities
+            .filter { $0.key != choice && $0.value >= 0.05 }
+            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(3)
+            .map { id, value in
+                targets[id].map { Alternative(operation: "click_element", role: $0.role, label: $0.label, probability: value) }
+                    ?? Alternative(operation: id, role: nil, label: nil, probability: value)
+            }
+        let signals = ["complete": complete, "consequential": consequential, "authorized": authorized]
+        func proposal(_ operation: String, _ target: Element? = nil, reason: String? = nil) -> Proposal {
+            Proposal(operation: operation, role: target?.role, label: target?.label, probability: probability,
+                     confidence: confidence, reason: reason, alternatives: alternatives, signals: signals)
+        }
+        if choice == "BLOCKED" { return proposal("BLOCKED", reason: "Jev found no safe action") }
+        if choice == "WAIT" { return proposal("WAIT") }
         if choice == "DONE" {
-            return Proposal(operation: probability >= 0.90 && complete >= 0.90 ? "DONE" : "BLOCKED", role: nil, label: nil, probability: probability, confidence: confidence)
+            return probability >= 0.90 && complete >= 0.90
+                ? proposal("DONE")
+                : proposal("BLOCKED", reason: "Completion evidence below threshold")
         }
         guard let target = targets[choice] else { throw JevDecisionError.invalidResponse }
         let sensitiveLabel = target.label.range(
@@ -196,9 +233,12 @@ public struct JevDecision: Sendable {
         guard probability >= (material ? 0.85 : 0.55),
               confidence >= (material ? 0.75 : 0.35),
               !material || authorized >= 0.90 else {
-            return Proposal(operation: "BLOCKED", role: nil, label: nil, probability: probability, confidence: confidence)
+            let why = material && authorized < 0.90
+                ? "Material action not explicitly authorized by the goal"
+                : "Choice below \(material ? "material" : "routine") confidence threshold"
+            return proposal("BLOCKED", reason: why)
         }
-        return Proposal(operation: "click_element", role: target.role, label: target.label, probability: probability, confidence: confidence)
+        return proposal("click_element", target)
     }
 
     public func localFallback(observation: String) throws -> [String: Any] {

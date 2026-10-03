@@ -28,10 +28,15 @@ On `human_activity`, stop acting on the tab and release it through `browser_clos
 
 The extension makes a best-effort activity check before removal; selection and removal are not atomic. If cleanup is uncertain, do not manufacture proof or accumulate replacement sessions. Use a safe, supported inspection/recovery path for the exact owned resource, or report what remains unverified. Never quit Chrome, close all tabs, or disconnect the shared extension as cleanup.
 
+## Prefer a cua Space when it fits
+
+Call `cua_status` before touching the user's Mac. If it reports `available: true` and the task does not need the user's own apps, windows, files or signed-in sessions, do the work in a cua Space through the `cua` MCP server instead (`list_spaces`, `create_space` with `reuse: true`, then its tools), name the Space in the answer, and delete any cloud Space you created. Use mac-use for work that must happen on the real Mac or in the user's Chrome profile.
+
 ## Native macOS windows
 
 - Select the exact `target_pid` and `target_window_id` from `list_windows`. Obtain a fresh `get_ui_tree` or `screenshot` observation and pass its token as `expected_state_token` for mutations. Reobserve after each mutation. Use `doctor` with the target for permission diagnostics.
-- Prefer Accessibility actions such as `click_element` using the observed role and label. `jev_decide` offers advice or local candidates; it neither authorizes nor executes an action. Without Jev, reason from available observations.
+- Prefer Accessibility actions such as `click_element` using the observed role and label. `jev_decide` offers advice or local candidates; it neither authorizes nor executes an action. Without Jev (`mode: llm`), choose from `candidates` using the user's goal.
+- With Jev (`mode: jev`), check its choice against the goal, `alternatives` and `signals`. On `BLOCKED`, read `reason`: ask the user when a material action lacks authorization, otherwise observe again or pick a listed candidate only when the goal makes it unambiguous. A high `consequential` signal needs explicit user authorization no matter what Jev chose.
 - Pointer/keyboard fallbacks require the exact window already focused. Do not activate another window merely to bypass that guard. `restore_window` changes focus and is only for an explicit user request; use the fresh token it returns. Stop when human activity or target validation rejects an action.
 - Close a task-created native window through its freshly observed close control, or a supported exact-window close action. There is no generic native `close_window` MCP tool. Do not quit an application that also contains the user's windows, discard the user's unsaved work, or use blind global shortcuts.
 
