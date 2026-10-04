@@ -23,6 +23,9 @@ const installed = makeEvent();
 const updated = makeEvent();
 let connection;
 const noopEvent = makeEvent();
+const clicked = makeEvent();
+const alarm = makeEvent();
+let connectCount = 0;
 const groupCalls = [];
 const groupUpdateCalls = [];
 let groupQueryResult = [];
@@ -35,11 +38,13 @@ globalThis.chrome = {
     onInstalled: installed,
     onStartup: noopEvent,
     connectNative() {
+      connectCount++;
       connection = {onMessage: makeEvent(), onDisconnect: makeEvent(), postMessage() {}, disconnect() { this.onDisconnect.fire(); }};
       return connection;
     },
   },
-  action: {onClicked: noopEvent, setBadgeText() {}, setTitle() {}},
+  alarms: {create() {}, onAlarm: alarm},
+  action: {onClicked: clicked, setBadgeText() {}, setTitle() {}},
   tabs: {
     onActivated: activated,
     onRemoved: removed,
@@ -258,4 +263,21 @@ test('grouping failure still lets browser_open succeed', async () => {
   groupThrow = false;
   await handleRequest({operation: 'browser_snapshot', session});
   await handleRequest({operation: 'browser_close', session});
+});
+
+test('alarm reconnects after a drop and clicking while connected keeps the connection', () => {
+  connection.onDisconnect.fire();
+  const dropped = connection;
+  const before = connectCount;
+  alarm.fire({name: 'other'});
+  assert.equal(connectCount, before);
+  alarm.fire({name: 'keep-connected'});
+  assert.equal(connectCount, before + 1);
+  assert.notEqual(connection, dropped);
+  let disconnects = 0;
+  connection.disconnect = () => { disconnects++; };
+  clicked.fire();
+  alarm.fire({name: 'keep-connected'});
+  assert.equal(disconnects, 0);
+  assert.equal(connectCount, before + 1);
 });

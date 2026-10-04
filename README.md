@@ -96,7 +96,7 @@ The Chrome extension is included in this repository. Load it into the same Chrom
    .build/release/mac-use-mcp install-chrome-host YOUR_32_LETTER_EXTENSION_ID
    ```
 
-6. Click the mac-use extension icon in Chrome. Its badge should say **ON**. In your MCP client, call `browser_status`; it should report `connected: true`.
+6. The extension connects by itself and reconnects automatically (it retries every 30 seconds); its badge should say **ON**. Clicking the icon retries at once. In your MCP client, call `browser_status`; it should report `connected: true`.
 
 The extension uses Chrome's native messaging to connect to the MCP server. If you move the repository or reload the extension and its ID changes, run the registration command again with the new path or ID. Use a regular Chrome window, not Incognito.
 
@@ -215,7 +215,7 @@ La extensión de Chrome está incluida en este repositorio. Cárgala en el mismo
    .build/release/mac-use-mcp install-chrome-host ID_DE_32_LETRAS
    ```
 
-6. Haz clic en el icono de mac-use en Chrome. El indicador debe mostrar **ON**. En tu cliente MCP, llama a `browser_status`; la respuesta debe incluir `connected: true`.
+6. Haz clic en el icono de mac-use en Chrome. El indicador debe mostrar **ON**. La extensión se conecta sola y se reconecta automáticamente cada 30 segundos si se cae; el clic solo fuerza un reintento inmediato. En tu cliente MCP, llama a `browser_status`; la respuesta debe incluir `connected: true`.
 
 La extensión usa la mensajería nativa de Chrome para conectarse al servidor MCP. Si mueves el repositorio o vuelves a cargar la extensión y cambia su ID, ejecuta otra vez el comando de registro con la ruta o el ID nuevos. Usa una ventana normal de Chrome, no el modo incógnito.
 
@@ -334,7 +334,7 @@ A extensão do Chrome está incluída neste repositório. Carregue-a no mesmo pe
    .build/release/mac-use-mcp install-chrome-host SEU_ID_DE_32_LETRAS
    ```
 
-6. Clique no ícone da extensão mac-use no Chrome. O indicador deve mostrar **ON**. No seu cliente MCP, chame `browser_status`; a resposta deve incluir `connected: true`.
+6. Clique no ícone da extensão mac-use no Chrome. O indicador deve mostrar **ON**. A extensão se conecta sozinha e reconecta automaticamente a cada 30 segundos se cair; o clique só força uma nova tentativa imediata. No seu cliente MCP, chame `browser_status`; a resposta deve incluir `connected: true`.
 
 A extensão usa o sistema de mensagens nativas do Chrome para se conectar ao servidor MCP. Se você mover o repositório ou recarregar a extensão e o ID mudar, execute novamente o comando de registro com o caminho ou ID atualizado. Use uma janela normal do Chrome, não o modo anônimo.
 
