@@ -2756,6 +2756,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             var loop: CFRunLoop?
         }
 
+        /// SwiftUI apps such as Calculator return kAXErrorNoValue for unset
+        /// attributes; that means "absent", not "unreadable".
+        static func attributeIsAbsent(_ status: AXError) -> Bool {
+            status == .attributeUnsupported || status == .noValue
+        }
+
         private static func uniqueElement(
             in window: AXUIElement,
             role: String,
@@ -2769,7 +2775,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     func readString(_ key: String) -> (value: String?, readable: Bool) {
                         var value: CFTypeRef?
                         let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
-                        if status == .attributeUnsupported { return (nil, true) }
+                        if attributeIsAbsent(status) { return (nil, true) }
                         guard status == .success else { return (nil, false) }
                         guard let value else { return (nil, true) }
                         guard let string = value as? String else { return (nil, false) }
@@ -2784,7 +2790,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 childrenOf: { element in
                     var value: CFTypeRef?
                     let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
-                    if result == .attributeUnsupported { return [] }
+                    if attributeIsAbsent(result) { return [] }
                     guard result == .success, let value else { return nil }
                     return axElements(from: value)
                 }

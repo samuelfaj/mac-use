@@ -130,6 +130,14 @@ final class NativeMCPTests: XCTestCase {
         ))
     }
 
+    func testAbsentAXAttributesDoNotAbortSemanticSearch() {
+        // Calculator's SwiftUI buttons report kAXErrorNoValue for AXTitle; treating
+        // that as unreadable made every click_element by label fail.
+        XCTAssertTrue(ComputerUseNativeHostBackend.NativePlatform.attributeIsAbsent(.noValue))
+        XCTAssertTrue(ComputerUseNativeHostBackend.NativePlatform.attributeIsAbsent(.attributeUnsupported))
+        XCTAssertFalse(ComputerUseNativeHostBackend.NativePlatform.attributeIsAbsent(.cannotComplete))
+    }
+
     private func testCapture() throws -> ComputerUseNativeCapture {
         let bitmap = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: 100, pixelsHigh: 100,
