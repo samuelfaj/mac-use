@@ -115,6 +115,16 @@ If the [cua](https://github.com/trycua/cua) CLI is installed (`curl -fsSL https:
 
 `jev_decide` suggests one step. With `JEV_API_KEY`, `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`, Jev answers and the reply also includes up to three runner-up `alternatives`, its `signals` (`complete`, `consequential`, `authorized`) and a `reason` when it returns `BLOCKED`, so your session LLM can check the advice or ask you. Without a key, it returns safe candidates for the session LLM to choose from. If a configured Jev call fails, the tool returns an error instead of switching silently. Neither path clicks anything.
 
+### Native window tools
+
+- `click_element` and `set_value` take either `element_id` (the `ax_<n>` id from the `get_ui_tree` whose token you pass) or `role` plus `label`, never both. `set_value` fills fields and combo boxes, sets sliders and checkboxes, and picks pop-up items. `menu_shortcut` presses the enabled menu item bound to a chord such as `MOD+S`.
+- `get_ui_tree` accepts `ocr: auto|always|never`. OCR text is appended after the tree on an `ocr:` line and needs Screen Recording permission; without it the tree is returned with an `ocr_error`.
+- Minimized windows and hidden apps work with the AX-only tools (`get_ui_tree`, `click_element`, `set_value`, `menu_shortcut`). Pointer and key tools need `restore_window` first.
+- Mutations wait for the UI to settle and return a fresh observation with `settle_ms` and `settled`.
+- `jev_decide` also takes `allowed_risks` (`delete`, `send`, `purchase`, `close`: controls in these categories are withheld unless listed), `min_confidence` and `min_margin` (0 to 1).
+- `run_subtask` needs a Jev key. Pass `goal`, `verification` (non-empty list), and optionally `constraints`, `inputs`, `max_actions` (default 30), `shortcuts`, `allowed_risks`, `secret_inputs` (input keys typed but never shown to Jev or returned), `dry_run`, `min_confidence`, `min_margin`. It observes, asks Jev for one step, acts and repeats, then returns `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT`, `NEEDS_AGENT` or `DRY_RUN`. Text typed comes only from `inputs`.
+- Chrome extension: `browser_act` waits for the page to settle and returns a fresh snapshot, so earlier `ref`s go stale. It also handles select options and fill, skips covered elements, and reports live-region changes.
+
 ### If Chrome says "Specified native messaging host not found"
 
 The extension's native host registration is missing or does not match the extension ID. From the `mac-use` folder, run the registration command again with the current ID from `chrome://extensions`. Then click the extension icon to reconnect. Check that `.build/release/mac-use-mcp` is still at the same path and that the extension is loaded in the Chrome profile you are using.
@@ -122,6 +132,10 @@ The extension's native host registration is missing or does not match the extens
 ### Privacy and control
 
 The Chrome extension can read page text and form values, except password values. It can click, fill, type, and scroll in tabs that it opened. It does not automate your selected tab; selecting an automated tab gives control back to you. When `browser_close` runs or the extension disconnects, it best-effort closes only tabs it created that still appear inactive and were not selected by the user. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Page content and snapshots are visible to your Distill session, so do not use the browser tools on pages containing information you do not want to share with that session. The extension requests access to HTTP and HTTPS sites because it needs to operate on pages you ask it to open.
+
+### Acknowledgements
+
+Thanks to [shhivv](https://github.com/shhivv) and [arc-cua](https://github.com/shhivv/arc-cua), the inspiration for `run_subtask`, `set_value`, `menu_shortcut`, `allowed_risks`, `secret_inputs`, OCR perception, UI settling and element ids.
 
 ---
 
@@ -234,6 +248,16 @@ Si la CLI de [cua](https://github.com/trycua/cua) está instalada (`curl -fsSL h
 
 `jev_decide` sugiere un paso. Con `JEV_API_KEY`, `TYPESAFE_API_KEY` u `OPENROUTER_API_KEY`, Jev responde y la respuesta también incluye hasta tres `alternatives`, sus `signals` (`complete`, `consequential`, `authorized`) y un `reason` cuando devuelve `BLOCKED`, para que el LLM de tu sesión revise la sugerencia o te pregunte. Sin clave, devuelve candidatos seguros para que el LLM de la sesión elija. Si una llamada a Jev configurado falla, la herramienta devuelve un error en lugar de cambiar en silencio. Ninguna de las dos opciones hace clic.
 
+### Herramientas de ventanas nativas
+
+- `click_element` y `set_value` aceptan `element_id` (el id `ax_<n>` del `get_ui_tree` cuyo token pasas) o `role` más `label`, nunca ambos. `set_value` rellena campos y combos, ajusta controles deslizantes y casillas, y elige elementos de menús emergentes. `menu_shortcut` pulsa el elemento de menú habilitado asociado a un atajo como `MOD+S`.
+- `get_ui_tree` acepta `ocr: auto|always|never`. El texto OCR se añade tras el árbol en una línea `ocr:` y requiere permiso de Grabación de pantalla; sin él se devuelve el árbol con un `ocr_error`.
+- Las ventanas minimizadas y las apps ocultas funcionan con las herramientas solo AX (`get_ui_tree`, `click_element`, `set_value`, `menu_shortcut`). Las herramientas de puntero y teclado necesitan `restore_window` antes.
+- Las mutaciones esperan a que la interfaz se estabilice y devuelven una observación nueva con `settle_ms` y `settled`.
+- `jev_decide` también acepta `allowed_risks` (`delete`, `send`, `purchase`, `close`: los controles de estas categorías se ocultan salvo que se indiquen), `min_confidence` y `min_margin` (0 a 1).
+- `run_subtask` requiere una clave de Jev. Pasa `goal`, `verification` (lista no vacía) y, opcionalmente, `constraints`, `inputs`, `max_actions` (por defecto 30), `shortcuts`, `allowed_risks`, `secret_inputs` (claves de `inputs` que se escriben pero nunca se muestran a Jev ni se devuelven), `dry_run`, `min_confidence`, `min_margin`. Observa, pide un paso a Jev, actúa y repite; devuelve `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT`, `NEEDS_AGENT` o `DRY_RUN`. El texto escrito sale solo de `inputs`.
+- Extensión de Chrome: `browser_act` espera a que la página se estabilice y devuelve una instantánea nueva, por lo que los `ref` anteriores quedan obsoletos. También gestiona opciones de select y rellenado, omite elementos cubiertos e informa de cambios en regiones en vivo.
+
 ### Si Chrome muestra "Specified native messaging host not found"
 
 Falta el registro del host nativo o el ID registrado no coincide con el de la extensión. Desde la carpeta `mac-use`, ejecuta de nuevo el comando de registro con el ID actual de `chrome://extensions`. Después, haz clic en el icono de la extensión para conectarla. Comprueba que `.build/release/mac-use-mcp` siga en la misma ruta y que la extensión esté cargada en el perfil de Chrome que estás usando.
@@ -241,6 +265,10 @@ Falta el registro del host nativo o el ID registrado no coincide con el de la ex
 ### Privacidad y control
 
 La extensión de Chrome puede leer el texto de las páginas y los valores de los formularios, excepto las contraseñas. Puede hacer clic, rellenar campos, escribir y desplazarse en las pestañas que abrió. No controla la pestaña seleccionada; si seleccionas una pestaña automatizada, recuperas el control. Al ejecutar `browser_close` o desconectarse la extensión, intenta cerrar únicamente las pestañas que creó y que siguen inactivas y no fueron seleccionadas por el usuario. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña; por eso, una selección que coincida con la eliminación todavía podría cerrarse. El contenido y las capturas de las páginas quedan visibles para tu sesión de Distill. No uses estas herramientas en páginas con información que no quieras compartir con esa sesión. La extensión solicita acceso a sitios HTTP y HTTPS para poder trabajar en las páginas que le pidas abrir.
+
+### Agradecimientos
+
+Gracias a [shhivv](https://github.com/shhivv) y [arc-cua](https://github.com/shhivv/arc-cua), la inspiración para `run_subtask`, `set_value`, `menu_shortcut`, `allowed_risks`, `secret_inputs`, la percepción por OCR, la estabilización de la interfaz y los ids de elementos.
 
 ---
 
@@ -353,6 +381,16 @@ Se a CLI do [cua](https://github.com/trycua/cua) estiver instalada (`curl -fsSL 
 
 `jev_decide` sugere um passo. Com `JEV_API_KEY`, `TYPESAFE_API_KEY` ou `OPENROUTER_API_KEY`, o Jev responde e a resposta também traz até três `alternatives`, seus `signals` (`complete`, `consequential`, `authorized`) e um `reason` quando retorna `BLOCKED`, para o LLM da sessão conferir a sugestão ou perguntar a você. Sem chave, retorna candidatos seguros para o LLM da sessão escolher. Se uma chamada ao Jev configurado falhar, a ferramenta retorna erro em vez de trocar em silêncio. Nenhum dos dois caminhos clica em nada.
 
+### Ferramentas de janelas nativas
+
+- `click_element` e `set_value` aceitam `element_id` (o id `ax_<n>` do `get_ui_tree` cujo token você passa) ou `role` mais `label`, nunca os dois. `set_value` preenche campos e combos, ajusta sliders e caixas de seleção e escolhe itens de menus pop-up. `menu_shortcut` aciona o item de menu habilitado associado a um atalho como `MOD+S`.
+- `get_ui_tree` aceita `ocr: auto|always|never`. O texto OCR é anexado após a árvore em uma linha `ocr:` e exige permissão de Gravação de Tela; sem ela, a árvore volta com um `ocr_error`.
+- Janelas minimizadas e apps ocultos funcionam com as ferramentas somente AX (`get_ui_tree`, `click_element`, `set_value`, `menu_shortcut`). Ferramentas de ponteiro e teclado precisam de `restore_window` antes.
+- As mutações esperam a interface estabilizar e retornam uma observação nova com `settle_ms` e `settled`.
+- `jev_decide` também aceita `allowed_risks` (`delete`, `send`, `purchase`, `close`: controles dessas categorias ficam ocultos, a menos que listados), `min_confidence` e `min_margin` (0 a 1).
+- `run_subtask` exige uma chave do Jev. Passe `goal`, `verification` (lista não vazia) e, opcionalmente, `constraints`, `inputs`, `max_actions` (padrão 30), `shortcuts`, `allowed_risks`, `secret_inputs` (chaves de `inputs` digitadas mas nunca mostradas ao Jev nem retornadas), `dry_run`, `min_confidence`, `min_margin`. Ele observa, pede um passo ao Jev, age e repete; retorna `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT`, `NEEDS_AGENT` ou `DRY_RUN`. O texto digitado vem somente de `inputs`.
+- Extensão do Chrome: `browser_act` espera a página estabilizar e retorna um snapshot novo, então os `ref` anteriores ficam obsoletos. Também trata opções de select e preenchimento, ignora elementos cobertos e informa mudanças em regiões ao vivo.
+
 ### Se o Chrome mostrar "Specified native messaging host not found"
 
 O registro do host nativo está ausente ou não corresponde ao ID da extensão. Na pasta `mac-use`, execute novamente o comando de registro com o ID atual de `chrome://extensions`. Depois, clique no ícone da extensão para conectar. Confira se `.build/release/mac-use-mcp` continua no mesmo caminho e se a extensão está carregada no perfil do Chrome que você está usando.
@@ -360,3 +398,7 @@ O registro do host nativo está ausente ou não corresponde ao ID da extensão. 
 ### Privacidade e controle
 
 A extensão do Chrome pode ler o texto das páginas e os valores dos formulários, exceto senhas. Ela pode clicar, preencher campos, digitar e rolar em abas que abriu. Ela não controla a aba selecionada; ao selecionar uma aba automatizada, você retoma o controle. Quando `browser_close` é chamado ou a extensão se desconecta, ela tenta fechar somente as abas que criou e que ainda aparentam estar inativas e não terem sido selecionadas pelo usuário. O Chrome não torna atômicas a verificação de atividade e a remoção da aba; portanto, uma seleção que coincida com a remoção ainda pode resultar no fechamento. O conteúdo e as capturas das páginas ficam visíveis para a sessão do Distill. Não use essas ferramentas em páginas com informações que você não queira compartilhar com essa sessão. A extensão solicita acesso a sites HTTP e HTTPS para poder operar nas páginas que você pedir para abrir.
+
+### Agradecimentos
+
+Obrigado a [shhivv](https://github.com/shhivv) e ao [arc-cua](https://github.com/shhivv/arc-cua), a inspiração para `run_subtask`, `set_value`, `menu_shortcut`, `allowed_risks`, `secret_inputs`, percepção por OCR, estabilização da interface e ids de elementos.

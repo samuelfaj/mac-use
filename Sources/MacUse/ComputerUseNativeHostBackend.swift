@@ -60,6 +60,265 @@ enum NativeSemanticTargetSearch {
     }
 }
 
+/// Decides when the UI has stopped reacting to a mutation. Notification source
+/// and clock are injected so the timing logic is testable without AX.
+public enum NativeSettle {
+    public static let firstNotificationWindow: TimeInterval = 0.6
+    public static let quietWindow: TimeInterval = 0.15
+    public static let maximumDuration: TimeInterval = 2.0
+
+    public struct Result: Sendable, Equatable {
+        public let settled: Bool
+        public let elapsedMilliseconds: Int
+
+        public init(settled: Bool, elapsedMilliseconds: Int) {
+            self.settled = settled
+            self.elapsedMilliseconds = elapsedMilliseconds
+        }
+
+        func combined(with other: Result) -> Result {
+            Result(
+                settled: settled && other.settled,
+                elapsedMilliseconds: elapsedMilliseconds + other.elapsedMilliseconds
+            )
+        }
+    }
+
+    /// `waitForNotification(timeout)` blocks up to `timeout` seconds and returns
+    /// true when a notification arrived. No reaction within the first window
+    /// counts as settled; only hitting the cap while still busy is unsettled.
+    public static func wait(
+        now: () -> TimeInterval,
+        waitForNotification: (TimeInterval) -> Bool
+    ) -> Result {
+        let start = now()
+        var sawNotification = false
+        while true {
+            let elapsed = now() - start
+            if elapsed >= maximumDuration {
+                return Result(settled: false, elapsedMilliseconds: milliseconds(elapsed))
+            }
+            let window = sawNotification ? quietWindow : firstNotificationWindow
+            let timeout = min(window, maximumDuration - elapsed)
+            if waitForNotification(timeout) {
+                sawNotification = true
+                continue
+            }
+            let total = now() - start
+            return Result(settled: timeout >= window, elapsedMilliseconds: milliseconds(total))
+        }
+    }
+
+    private static func milliseconds(_ interval: TimeInterval) -> Int {
+        Int((max(0, interval) * 1000).rounded())
+    }
+}
+
+/// Registered before the mutation so no notification is missed; `wait` is
+/// called after the action and `cancel` is always safe to call.
+public struct NativeSettleWatcher: @unchecked Sendable {
+    public var wait: @Sendable () -> NativeSettle.Result
+    public var cancel: @Sendable () -> Void
+
+    public init(
+        wait: @escaping @Sendable () -> NativeSettle.Result,
+        cancel: @escaping @Sendable () -> Void = {}
+    ) {
+        self.wait = wait
+        self.cancel = cancel
+    }
+
+    public static let immediate = NativeSettleWatcher(
+        wait: { NativeSettle.Result(settled: true, elapsedMilliseconds: 0) }
+    )
+}
+
+/// `ax_<n>` ids from get_ui_tree: depth-first index under the same node and
+/// depth limits as the serializer. Only valid with that observation's token.
+enum NativeElementID {
+    static let maximumNodes = 200
+    static let maximumDepth = 8
+
+    static func index(_ id: String) -> Int? {
+        guard id.hasPrefix("ax_") else { return nil }
+        let digits = id.dropFirst(3)
+        guard !digits.isEmpty, digits.count <= 3,
+              digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+              digits == "0" || !digits.hasPrefix("0"),
+              let value = Int(digits), value < maximumNodes else { return nil }
+        return value
+    }
+}
+
+enum NativeElementSelector: Equatable {
+    case roleLabel(role: String, label: String)
+    case id(String)
+
+    /// Exactly one of `element_id` or `role`+`label`.
+    static func parse(_ arguments: [String: Any]) -> (selector: NativeElementSelector?, error: String?) {
+        if let rawID = arguments["element_id"] {
+            guard arguments["role"] == nil, arguments["label"] == nil else {
+                return (nil, "provide either element_id or role+label, not both")
+            }
+            guard let id = rawID as? String, NativeElementID.index(id) != nil else {
+                return (nil, "element_id is out of range or malformed; use an ax_<n> id from get_ui_tree")
+            }
+            return (.id(id), nil)
+        }
+        let role = arguments["role"] as? String ?? ""
+        let label = arguments["label"] as? String ?? ""
+        guard !role.isEmpty, !label.isEmpty else {
+            return (nil, "provide either element_id or role and label")
+        }
+        return (.roleLabel(role: role, label: label), nil)
+    }
+}
+
+public enum ComputerUseNativeSetValueResult: Sendable, Equatable {
+    case applied
+    case failed(String)
+}
+
+public enum ComputerUseNativeMenuShortcutResult: Sendable, Equatable {
+    case applied
+    case noMenuItem
+    case ambiguous
+    case failed
+    case refused(String)
+}
+
+/// Refuses a menu item whose title names a risk category the caller did not allow.
+enum NativeRiskGuard {
+    static func refusal(title: String?, allowed: Set<RiskCategory>?) -> String? {
+        guard let allowed, let title else { return nil }
+        let missing = RiskCategory.categories(title).subtracting(allowed)
+        guard !missing.isEmpty else { return nil }
+        return "risky menu item '\(title)' requires allowed_risks \(missing.map(\.rawValue).sorted().joined(separator: ", "))"
+    }
+
+    /// Presses the single titled pop-up item unless its title is risky; the menu is cancelled otherwise.
+    static func selectPopUpItem<Node>(
+        items: [Node], title: String, titleOf: (Node) -> String?, allowed: Set<RiskCategory>?,
+        press: (Node) -> Bool, cancel: () -> Void
+    ) -> ComputerUseNativeSetValueResult {
+        let matches = items.filter { titleOf($0) == title }
+        guard matches.count == 1 else {
+            cancel()
+            return .failed(matches.isEmpty ? "no pop-up item titled \(title)" : "more than one pop-up item titled \(title)")
+        }
+        if let refusal = refusal(title: title, allowed: allowed) {
+            cancel()
+            return .failed(refusal)
+        }
+        guard press(matches[0]) else {
+            cancel()
+            return .failed("could not press the pop-up item")
+        }
+        return .applied
+    }
+
+    /// Presses the single menu-shortcut match unless its title is risky.
+    static func pressShortcutMatch<Node>(
+        matches: [Node], titleOf: (Node) -> String?, allowed: Set<RiskCategory>?, press: (Node) -> Bool
+    ) -> ComputerUseNativeMenuShortcutResult {
+        guard matches.count == 1 else { return matches.isEmpty ? .noMenuItem : .ambiguous }
+        if let refusal = refusal(title: titleOf(matches[0]), allowed: allowed) { return .refused(refusal) }
+        return press(matches[0]) ? .applied : .failed
+    }
+}
+
+/// "MOD+S" style chord: MOD=Cmd, CTRL, ALT, SHIFT plus one key character.
+public struct ComputerUseNativeMenuChord: Sendable, Equatable {
+    public let key: String
+    public let command: Bool
+    public let control: Bool
+    public let option: Bool
+    public let shift: Bool
+
+    /// AXMenuItemCmdModifiers bitmask: shift=1, option=2, control=4, no-command=8.
+    public var axModifiers: Int {
+        (shift ? 1 : 0) | (option ? 2 : 0) | (control ? 4 : 0) | (command ? 0 : 8)
+    }
+
+    public var isSelectAll: Bool {
+        key == "A" && command && !control && !option && !shift
+    }
+
+    public static func parse(_ value: Any?) -> ComputerUseNativeMenuChord? {
+        guard let text = (value as? String)?.trimmingCharacters(in: .whitespaces), !text.isEmpty else {
+            return nil
+        }
+        let key: String
+        let modifierNames: [Substring]
+        if text.hasSuffix("++") {
+            key = "+"
+            modifierNames = text.dropLast(2).split(separator: "+", omittingEmptySubsequences: false)
+        } else {
+            let parts = text.split(separator: "+", omittingEmptySubsequences: false)
+            guard parts.count >= 2, let last = parts.last else { return nil }
+            key = String(last)
+            modifierNames = Array(parts.dropLast())
+        }
+        guard key.unicodeScalars.count == 1,
+              let scalar = key.unicodeScalars.first,
+              !CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains(scalar),
+              !modifierNames.isEmpty else { return nil }
+        var command = false, control = false, option = false, shift = false
+        for name in modifierNames {
+            switch name.uppercased() {
+            case "MOD", "CMD", "COMMAND":
+                guard !command else { return nil }
+                command = true
+            case "CTRL", "CONTROL":
+                guard !control else { return nil }
+                control = true
+            case "ALT", "OPTION":
+                guard !option else { return nil }
+                option = true
+            case "SHIFT":
+                guard !shift else { return nil }
+                shift = true
+            default:
+                return nil
+            }
+        }
+        return ComputerUseNativeMenuChord(
+            key: key.uppercased(), command: command, control: control, option: option, shift: shift
+        )
+    }
+}
+
+enum NativeMenuShortcutSearch {
+    static let maximumNodes = 4_000
+
+    /// Up to two enabled menu items carrying the chord; two means ambiguous.
+    static func enabledMatches<Node>(
+        root: Node,
+        chord: ComputerUseNativeMenuChord,
+        attributesOf: (Node) -> (role: String?, enabled: Bool, cmdChar: String?, cmdModifiers: Int?)?,
+        childrenOf: (Node) -> [Node]?
+    ) -> [Node] {
+        var matches: [Node] = []
+        var visited = 0
+        func visit(_ node: Node, depth: Int) {
+            guard matches.count < 2, depth < 10, visited < maximumNodes,
+                  let attributes = attributesOf(node) else { return }
+            visited += 1
+            guard attributes.enabled else { return }
+            if attributes.role == "AXMenuItem",
+               let cmdChar = attributes.cmdChar,
+               cmdChar.uppercased() == chord.key,
+               (attributes.cmdModifiers ?? 0) == chord.axModifiers {
+                matches.append(node)
+                return
+            }
+            for child in childrenOf(node) ?? [] { visit(child, depth: depth + 1) }
+        }
+        visit(root, depth: 0)
+        return matches
+    }
+}
+
 public enum ComputerUseNativeClickResult: Sendable {
     case applied
     case noAXTarget
@@ -315,6 +574,43 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public var hostLauncherPath: @Sendable () -> String? = {
             NativePlatform.hostLauncherExecutablePath()
         }
+        /// Unique role+label element set to `value` through AX; no focus change.
+        public var setValue: @Sendable (ComputerUseNativeHostTarget, String, String, String, Set<RiskCategory>?) -> ComputerUseNativeSetValueResult = {
+            NativePlatform.setValue(target: $0, role: $1, label: $2, value: $3, allowedRisks: $4)
+        }
+        /// AXPress on the enabled menu item carrying the chord; no activation.
+        public var menuShortcut: @Sendable (ComputerUseNativeHostTarget, ComputerUseNativeMenuChord, Set<RiskCategory>?) -> ComputerUseNativeMenuShortcutResult = {
+            NativePlatform.menuShortcut(target: $0, chord: $1, allowedRisks: $2)
+        }
+        /// AXConfirm on a unique role+label element.
+        public var semanticConfirm: @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool = {
+            NativePlatform.semanticConfirm(target: $0, role: $1, label: $2)
+        }
+        /// True when the app's AX-focused element is the unique role+label element.
+        public var isFocusedElement: @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool = {
+            NativePlatform.isFocusedElement(target: $0, role: $1, label: $2)
+        }
+        /// Registered before a mutation; waits for the UI to settle afterwards.
+        public var settleWatcher: @Sendable (ComputerUseNativeHostTarget) -> NativeSettleWatcher = {
+            NativePlatform.settleWatcher(target: $0)
+        }
+        /// Same as the role+label hooks, addressed by a get_ui_tree `ax_<n>` id.
+        public var semanticActionByID: @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+            NativePlatform.semanticAction(target: $0, elementID: $1)
+        }
+        public var setValueByID: @Sendable (ComputerUseNativeHostTarget, String, String, Set<RiskCategory>?) -> ComputerUseNativeSetValueResult = {
+            NativePlatform.setValue(target: $0, elementID: $1, value: $2, allowedRisks: $3)
+        }
+        public var semanticConfirmByID: @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+            NativePlatform.semanticConfirm(target: $0, elementID: $1)
+        }
+        public var isFocusedElementByID: @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+            NativePlatform.isFocusedElement(target: $0, elementID: $1)
+        }
+        /// Text recognition on a captured window image; evidence only.
+        public var recognizeText: @Sendable (CGImage) async throws -> [OCRElement] = {
+            try await OCRPerception.recognize($0)
+        }
 
         public init(
             listWindows: @escaping @Sendable (String?) -> [ComputerUseNativeWindow] = {
@@ -361,8 +657,48 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             },
             hostLauncherPath: @escaping @Sendable () -> String? = {
                 NativePlatform.hostLauncherExecutablePath()
+            },
+            setValue: @escaping @Sendable (ComputerUseNativeHostTarget, String, String, String, Set<RiskCategory>?) -> ComputerUseNativeSetValueResult = {
+                NativePlatform.setValue(target: $0, role: $1, label: $2, value: $3, allowedRisks: $4)
+            },
+            menuShortcut: @escaping @Sendable (ComputerUseNativeHostTarget, ComputerUseNativeMenuChord, Set<RiskCategory>?) -> ComputerUseNativeMenuShortcutResult = {
+                NativePlatform.menuShortcut(target: $0, chord: $1, allowedRisks: $2)
+            },
+            semanticConfirm: @escaping @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool = {
+                NativePlatform.semanticConfirm(target: $0, role: $1, label: $2)
+            },
+            isFocusedElement: @escaping @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool = {
+                NativePlatform.isFocusedElement(target: $0, role: $1, label: $2)
+            },
+            settleWatcher: @escaping @Sendable (ComputerUseNativeHostTarget) -> NativeSettleWatcher = {
+                NativePlatform.settleWatcher(target: $0)
+            },
+            semanticActionByID: @escaping @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+                NativePlatform.semanticAction(target: $0, elementID: $1)
+            },
+            setValueByID: @escaping @Sendable (ComputerUseNativeHostTarget, String, String, Set<RiskCategory>?) -> ComputerUseNativeSetValueResult = {
+                NativePlatform.setValue(target: $0, elementID: $1, value: $2, allowedRisks: $3)
+            },
+            semanticConfirmByID: @escaping @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+                NativePlatform.semanticConfirm(target: $0, elementID: $1)
+            },
+            isFocusedElementByID: @escaping @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
+                NativePlatform.isFocusedElement(target: $0, elementID: $1)
+            },
+            recognizeText: @escaping @Sendable (CGImage) async throws -> [OCRElement] = {
+                try await OCRPerception.recognize($0)
             }
         ) {
+            self.semanticActionByID = semanticActionByID
+            self.setValueByID = setValueByID
+            self.semanticConfirmByID = semanticConfirmByID
+            self.isFocusedElementByID = isFocusedElementByID
+            self.recognizeText = recognizeText
+            self.setValue = setValue
+            self.menuShortcut = menuShortcut
+            self.semanticConfirm = semanticConfirm
+            self.isFocusedElement = isFocusedElement
+            self.settleWatcher = settleWatcher
             self.hostLauncherPath = hostLauncherPath
             self.listWindows = listWindows
             self.userActivity = userActivity
@@ -604,19 +940,32 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let observation = await makeObservation(window: window, kind: .semantic)
             return ComputerUseToolResult(text: encodeObservation(observation))
         case "get_ui_tree":
+            let ocrMode = (arguments["ocr"] as? String) ?? "auto"
+            guard arguments["ocr"] == nil || ["auto", "always", "never"].contains(ocrMode) else {
+                return failure(.invalid_target, "ocr must be auto, always or never")
+            }
             let tree = hooks.uiTree(target)
             let observation = await makeObservation(window: window, kind: .semantic, content: tree)
             guard observation.accessibilityPermission,
                   let tree else {
                 return failure(.ui_tree_unavailable, encodeObservation(observation))
             }
-            return ComputerUseToolResult(text: encodeObservation(observation) + "\nui_tree: \(tree)")
+            // OCR is evidence appended after the AX tree; it never changes the
+            // semantic token and never fails the call.
+            let perception = await ocrPerception(mode: ocrMode, tree: tree, target: target, observation: observation)
+            var extra: [String: Any] = ["perception_sources": perception.elements == nil ? ["ax"] : ["ax", "ocr"]]
+            if let error = perception.error { extra["ocr_error"] = error }
+            var text = encodeObservation(observation, extra: extra) + "\nui_tree: \(tree)"
+            if let elements = perception.elements {
+                text += "\nocr: \(encode(OCRPerception.jsonObject(elements)))"
+            }
+            return ComputerUseToolResult(text: text)
         case "cursor_position":
             let observation = await makeObservation(window: window, kind: .geometry)
             return ComputerUseToolResult(text: encodeObservation(observation) + "\n"
                 + "cursor_position: \(Self.cursorPosition())")
-        case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "open_application", "restore_window":
-            let kind: TokenKind = name == "restore_window" || name == "key" ? .geometry : (["type", "click_element"].contains(name) ? .semantic : .pixel)
+        case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "set_value", "menu_shortcut", "open_application", "restore_window":
+            let kind: TokenKind = name == "restore_window" || name == "key" ? .geometry : (["type", "click_element", "set_value", "menu_shortcut"].contains(name) ? .semantic : .pixel)
             // Preflight only needs metadata. Read the expensive pixels/AX tree
             // once, after the human-activity check, in mutate's final validation.
             let observation = await makeObservation(window: window, kind: .geometry)
@@ -761,6 +1110,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         if hooks.userActivity(target) == .human {
             return failure(.human_activity, encodeObservation(observation))
         }
+        if observation.isMinimized,
+           ["left_click", "right_click", "mouse_move", "scroll", "type", "key"].contains(name) {
+            return failure(
+                .pixel_target_not_renderable,
+                "\(name) needs input events; restore_window first\n\(encodeObservation(observation))"
+            )
+        }
         guard let expected = arguments["expected_state_token"] as? String,
               !expected.isEmpty else {
             return failure(.missing_state_token, encodeObservation(observation))
@@ -821,6 +1177,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             if hooks.userActivity(target) == .human {
                 return failure(.human_activity, encodeObservation(freshObservation))
             }
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
             if name == "left_click" {
                 switch hooks.leftClick(target, coordinate) {
                 case .applied:
@@ -855,8 +1213,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard let postWindow = resolve(target: target, arguments: arguments) else {
                 return failure(.target_not_found, encodeObservation(freshObservation))
             }
+            let settle = watcher.wait()
             let postObservation = await makeObservation(window: postWindow, kind: .pixel, pixelScope: expectedPixelScope)
-            return ComputerUseToolResult(text: "native \(name) applied\n\(encodeObservation(postObservation))")
+            return ComputerUseToolResult(text: "native \(name) applied\n\(encodeObservation(postObservation, settle: settle))")
         case "key":
             guard hooks.focusedTarget(target),
                   let parsedKey = Self.parsedKey(arguments["key"], modifiers: arguments["modifiers"]) else {
@@ -871,23 +1230,25 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard currentWindow == freshWindow else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
             guard hooks.pixelAction(target, "key", [Double(parsedKey.keyCode), Double(parsedKey.flags)]) else {
                 return failure(.focus_required, encodeObservation(freshObservation))
             }
             guard let postWindow = resolve(target: target, arguments: arguments) else {
                 return failure(.target_not_found, encodeObservation(freshObservation))
             }
+            let settle = watcher.wait()
             let postObservation = await makeObservation(window: postWindow, kind: .geometry)
-            return ComputerUseToolResult(text: "native key applied; target remained explicitly focused\n\(encodeObservation(postObservation))")
+            return ComputerUseToolResult(text: "native key applied; target remained explicitly focused\n\(encodeObservation(postObservation, settle: settle))")
         case "click_element":
             guard freshObservation.accessibilityPermission,
                   freshObservation.capabilities.contains("semantic_ax") else {
                 return failure(.permission_required, encodeObservation(freshObservation))
             }
-            let role = arguments["role"] as? String ?? ""
-            let label = arguments["label"] as? String ?? ""
-            guard !role.isEmpty, !label.isEmpty else {
-                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            let parsed = NativeElementSelector.parse(arguments)
+            guard let selector = parsed.selector else {
+                return failure(.semantic_action_failed, "\(parsed.error ?? "invalid element selector")\n\(encodeObservation(freshObservation))")
             }
             guard let currentWindow = resolve(target: target, arguments: arguments) else {
                 return failure(.target_not_found, encodeObservation(freshObservation))
@@ -895,10 +1256,149 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard currentWindow == freshWindow else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
-            guard hooks.semanticAction(target, role, label) else {
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
+            let pressed: Bool
+            switch selector {
+            case .roleLabel(let role, let label): pressed = hooks.semanticAction(target, role, label)
+            case .id(let id): pressed = hooks.semanticActionByID(target, id)
+            }
+            guard pressed else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native semantic action applied\n\(encodeObservation(freshObservation))")
+            let settle = watcher.wait()
+            return await semanticResult(
+                "native semantic action applied", target: target, arguments: arguments,
+                fallback: freshObservation, settle: settle
+            )
+        case "set_value":
+            guard freshObservation.accessibilityPermission,
+                  freshObservation.capabilities.contains("semantic_ax") else {
+                return failure(.permission_required, encodeObservation(freshObservation))
+            }
+            let parsed = NativeElementSelector.parse(arguments)
+            guard let selector = parsed.selector else {
+                return failure(.semantic_action_failed, "\(parsed.error ?? "invalid element selector")\n\(encodeObservation(freshObservation))")
+            }
+            guard let value = arguments["value"] as? String else {
+                return failure(.semantic_action_failed, "string value is required\n\(encodeObservation(freshObservation))")
+            }
+            let submitKey = (arguments["submit_key"] as? String)?.uppercased()
+            if arguments["submit_key"] != nil, submitKey != "ENTER", submitKey != "TAB" {
+                return failure(.semantic_action_failed, "submit_key must be ENTER or TAB\n\(encodeObservation(freshObservation))")
+            }
+            let allowedRisks: Set<RiskCategory>?
+            switch Self.allowedRisks(arguments["allowed_risks"]) {
+            case .success(let value): allowedRisks = value
+            case .failure(let message):
+                return failure(.semantic_action_failed, "\(message)\n\(encodeObservation(freshObservation))")
+            }
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
+            let setResult: ComputerUseNativeSetValueResult
+            switch selector {
+            case .roleLabel(let role, let label): setResult = hooks.setValue(target, role, label, value, allowedRisks)
+            case .id(let id): setResult = hooks.setValueByID(target, id, value, allowedRisks)
+            }
+            if case .failed(let reason) = setResult {
+                return failure(.semantic_action_failed, "\(reason)\n\(encodeObservation(freshObservation))")
+            }
+            var settle = watcher.wait()
+            var message = "native value set"
+            func isFocused(_ selector: NativeElementSelector) -> Bool {
+                switch selector {
+                case .roleLabel(let role, let label): return hooks.isFocusedElement(target, role, label)
+                case .id(let id): return hooks.isFocusedElementByID(target, id)
+                }
+            }
+            func confirm(_ selector: NativeElementSelector) -> Bool {
+                switch selector {
+                case .roleLabel(let role, let label): return hooks.semanticConfirm(target, role, label)
+                case .id(let id): return hooks.semanticConfirmByID(target, id)
+                }
+            }
+            if let submitKey {
+                let submitWatcher = hooks.settleWatcher(target)
+                defer { submitWatcher.cancel() }
+                var submitted = false
+                // The value is already set; a user takeover or window change during the settle must block both submit paths.
+                func submitBlocked() -> ComputerUseToolResult? {
+                    if hooks.userActivity(target) == .human {
+                        return failure(.human_activity, "value set; submit_key \(submitKey) not applied\n\(encodeObservation(freshObservation))")
+                    }
+                    guard let current = resolve(target: target, arguments: arguments) else {
+                        return failure(.target_not_found, encodeObservation(freshObservation))
+                    }
+                    guard current == freshWindow else {
+                        return failure(.stale_state_token, encodeObservation(freshObservation))
+                    }
+                    return nil
+                }
+                if let blocked = submitBlocked() { return blocked }
+                if hooks.focusedTarget(target), isFocused(selector),
+                   let key = Self.parsedKey(submitKey == "ENTER" ? "return" : "tab", modifiers: nil) {
+                    submitted = hooks.pixelAction(target, "key", [Double(key.keyCode), Double(key.flags)])
+                    message += submitted ? "; \(submitKey) key posted" : ""
+                }
+                if !submitted, submitKey == "ENTER" {
+                    if let blocked = submitBlocked() { return blocked }
+                }
+                if !submitted, submitKey == "ENTER", confirm(selector) {
+                    submitted = true
+                    message += "; AXConfirm performed"
+                }
+                if submitted {
+                    settle = settle.combined(with: submitWatcher.wait())
+                } else {
+                    message += "; submit_key \(submitKey) not applied: target not focused (use restore_window first)"
+                }
+            }
+            return await semanticResult(message, target: target, arguments: arguments, fallback: freshObservation, settle: settle)
+        case "menu_shortcut":
+            guard freshObservation.accessibilityPermission,
+                  freshObservation.capabilities.contains("semantic_ax") else {
+                return failure(.permission_required, encodeObservation(freshObservation))
+            }
+            guard let chord = ComputerUseNativeMenuChord.parse(arguments["chord"]) else {
+                return failure(.semantic_action_failed, "invalid chord; use MOD/CTRL/ALT/SHIFT plus one key, e.g. MOD+S\n\(encodeObservation(freshObservation))")
+            }
+            let allowedRisks: Set<RiskCategory>?
+            switch Self.allowedRisks(arguments["allowed_risks"]) {
+            case .success(let value): allowedRisks = value
+            case .failure(let message):
+                return failure(.semantic_action_failed, "\(message)\n\(encodeObservation(freshObservation))")
+            }
+            guard let currentWindow = resolve(target: target, arguments: arguments) else {
+                return failure(.target_not_found, encodeObservation(freshObservation))
+            }
+            guard currentWindow == freshWindow else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
+            switch hooks.menuShortcut(target, chord, allowedRisks) {
+            case .applied:
+                break
+            case .refused(let reason):
+                return failure(.semantic_action_failed, "\(reason)\n\(encodeObservation(freshObservation))")
+            case .noMenuItem:
+                return failure(.semantic_action_failed, "no enabled menu item has this shortcut\n\(encodeObservation(freshObservation))")
+            case .ambiguous:
+                return failure(.semantic_action_failed, "more than one enabled menu item has this shortcut\n\(encodeObservation(freshObservation))")
+            case .failed:
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            }
+            let settle = watcher.wait()
+            return await semanticResult(
+                "native menu shortcut applied", target: target, arguments: arguments,
+                fallback: freshObservation, settle: settle
+            )
         case "restore_window":
             guard let currentWindow = resolve(target: target, arguments: arguments) else {
                 return failure(.target_not_found, encodeObservation(freshObservation))
@@ -929,13 +1429,84 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard currentWindow == freshWindow else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
+            let watcher = hooks.settleWatcher(target)
+            defer { watcher.cancel() }
             guard hooks.typeText(target, text) else {
                 return failure(.focus_required, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native background typing applied\n\(encodeObservation(freshObservation))")
+            let settle = watcher.wait()
+            return await semanticResult(
+                "native background typing applied", target: target, arguments: arguments,
+                fallback: freshObservation, settle: settle
+            )
         default:
             return failure(.invalid_target, "unsupported native mutation")
         }
+    }
+
+    private func ocrPerception(
+        mode: String,
+        tree: String,
+        target: ComputerUseNativeHostTarget,
+        observation: ComputerUseNativeHostObservation
+    ) async -> (elements: [OCRElement]?, error: String?) {
+        guard mode != "never" else { return (nil, nil) }
+        if mode == "auto" {
+            guard let data = tree.data(using: .utf8),
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  OCRPerception.needsOCR(uiTree: root) else { return (nil, nil) }
+        }
+        guard observation.captureMode == "window" else {
+            return (nil, "window is not renderable or screen capture is not granted")
+        }
+        let capture: ComputerUseNativeCapture
+        switch await hooks.capture(target) {
+        case .success(let image), .quartzFallback(let image):
+            capture = image
+        case .unavailable(let reason):
+            return (nil, "capture failed: \(reason)")
+        }
+        guard !Self.captureDataExceedsBudget(capture),
+              let decoded = Self.decodedCaptureImage(capture) else {
+            return (nil, "capture could not be decoded")
+        }
+        do {
+            return (try await hooks.recognizeText(decoded.image), nil)
+        } catch {
+            return (nil, "ocr failed: \(String(describing: error).prefix(200))")
+        }
+    }
+
+    /// Fresh semantic observation after a settled AX mutation; its token is
+    /// the one to use for the next action.
+    private func semanticResult(
+        _ message: String,
+        target: ComputerUseNativeHostTarget,
+        arguments: [String: Any],
+        fallback: ComputerUseNativeHostObservation,
+        settle: NativeSettle.Result
+    ) async -> ComputerUseToolResult {
+        guard let postWindow = resolve(target: target, arguments: arguments) else {
+            return failure(.target_not_found, encodeObservation(fallback))
+        }
+        let post = await makeObservation(window: postWindow, kind: .semantic)
+        return ComputerUseToolResult(text: "\(message)\n\(encodeObservation(post, settle: settle))")
+    }
+
+    /// nil when the argument is absent; an empty list allows no risky category.
+    private static func allowedRisks(_ raw: Any?) -> Result<Set<RiskCategory>?, SubtaskError> {
+        guard let raw else { return .success(nil) }
+        guard let names = raw as? [String] else {
+            return .failure(.invalid(field: "allowed_risks", reason: "must be an array of strings"))
+        }
+        var categories = Set<RiskCategory>()
+        for name in names {
+            guard let category = RiskCategory(rawValue: name) else {
+                return .failure(.invalid(field: "allowed_risks", reason: "every entry must be one of delete, send, purchase, close"))
+            }
+            categories.insert(category)
+        }
+        return .success(categories)
     }
 
     private func failure(_ error: Failure, _ detail: String) -> ComputerUseToolResult {
@@ -967,7 +1538,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return "Missing \(missing.joined(separator: " and ")) for \(app). macOS grants these to the launching app, not to this helper: in System Settings › Privacy & Security enable it for that app; if it is already listed, remove the entry and add the app again (the entry may belong to an older build), then start a new run."
     }
 
-    private func encodeObservation(_ observation: ComputerUseNativeHostObservation) -> String {
+    private func encodeObservation(
+        _ observation: ComputerUseNativeHostObservation,
+        settle: NativeSettle.Result? = nil,
+        extra: [String: Any] = [:]
+    ) -> String {
         var object: [String: Any] = [
             "target_pid": Int(observation.target.pid),
             "target_window_id": Int(observation.target.windowID),
@@ -982,6 +1557,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             "is_minimized": observation.isMinimized,
             "is_on_screen": observation.isOnScreen,
         ]
+        object.merge(extra) { _, new in new }
+        if let settle {
+            object["settle_ms"] = settle.elapsedMilliseconds
+            object["settled"] = settle.settled
+        }
         if !observation.accessibilityPermission || !observation.screenCapturePermission {
             let launchedBy = hooks.hostLauncherPath()
             object["launched_by"] = launchedBy as Any
@@ -2090,16 +2670,98 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return nil
         }
 
-        public static func semanticAction(
-            target: ComputerUseNativeHostTarget,
+        /// Wakes `NativeSettle` waiters from AXObserver callbacks on the watcher thread.
+        private final class SettleSignal: @unchecked Sendable {
+            private let condition = NSCondition()
+            private var received = 0
+            private var consumed = 0
+
+            func notify() {
+                condition.lock()
+                received += 1
+                condition.broadcast()
+                condition.unlock()
+            }
+
+            func wait(timeout: TimeInterval) -> Bool {
+                let deadline = Date().addingTimeInterval(timeout)
+                condition.lock()
+                defer { condition.unlock() }
+                while received == consumed {
+                    if !condition.wait(until: deadline) { return false }
+                }
+                consumed = received
+                return true
+            }
+        }
+
+        private static let settleNotifications: [String] = [
+            kAXValueChangedNotification, kAXUIElementDestroyedNotification, kAXCreatedNotification,
+            kAXFocusedUIElementChangedNotification, kAXLayoutChangedNotification,
+            kAXTitleChangedNotification, kAXWindowCreatedNotification,
+            kAXSelectedChildrenChangedNotification, kAXMenuOpenedNotification,
+        ]
+
+        private static let settleCallback: AXObserverCallback = { _, _, _, refcon in
+            guard let refcon else { return }
+            Unmanaged<SettleSignal>.fromOpaque(refcon).takeUnretainedValue().notify()
+        }
+
+        /// Registers an AXObserver on the app element (own run-loop thread) so
+        /// notifications raised by the mutation are not missed.
+        public static func settleWatcher(target: ComputerUseNativeHostTarget) -> NativeSettleWatcher {
+            guard AXIsProcessTrusted() else { return .immediate }
+            var created: AXObserver?
+            guard AXObserverCreate(target.pid, settleCallback, &created) == .success,
+                  let observer = created else { return .immediate }
+            let signal = SettleSignal()
+            let refcon = Unmanaged.passUnretained(signal).toOpaque()
+            let app = AXUIElementCreateApplication(target.pid)
+            var registered = 0
+            for name in settleNotifications
+            where AXObserverAddNotification(observer, app, name as CFString, refcon) == .success {
+                registered += 1
+            }
+            guard registered > 0 else { return .immediate }
+            let ready = DispatchSemaphore(value: 0)
+            let loopBox = RunLoopBox()
+            let thread = Thread {
+                let loop = CFRunLoopGetCurrent()
+                loopBox.loop = loop
+                CFRunLoopAddSource(loop, AXObserverGetRunLoopSource(observer), .defaultMode)
+                ready.signal()
+                CFRunLoopRun()
+            }
+            thread.name = "mac-use.SettleObserver"
+            thread.start()
+            ready.wait()
+            return NativeSettleWatcher(
+                wait: {
+                    NativeSettle.wait(
+                        now: { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 },
+                        waitForNotification: { signal.wait(timeout: $0) }
+                    )
+                },
+                cancel: {
+                    if let loop = loopBox.loop {
+                        CFRunLoopRemoveSource(loop, AXObserverGetRunLoopSource(observer), .defaultMode)
+                        CFRunLoopStop(loop)
+                    }
+                    withExtendedLifetime(signal) {}
+                }
+            )
+        }
+
+        private final class RunLoopBox: @unchecked Sendable {
+            var loop: CFRunLoop?
+        }
+
+        private static func uniqueElement(
+            in window: AXUIElement,
             role: String,
             label: String
-        ) -> Bool {
-            guard AXIsProcessTrusted() else { return false }
-            guard let window = exactAXWindow(target: target) else {
-                return false
-            }
-            guard let match = NativeSemanticTargetSearch.uniqueMatch(
+        ) -> AXUIElement? {
+            NativeSemanticTargetSearch.uniqueMatch(
                 root: window,
                 role: role,
                 label: label,
@@ -2126,8 +2788,230 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     guard result == .success, let value else { return nil }
                     return axElements(from: value)
                 }
-            ) else { return false }
+            )
+        }
+
+        public static func semanticAction(
+            target: ComputerUseNativeHostTarget,
+            role: String,
+            label: String
+        ) -> Bool {
+            guard AXIsProcessTrusted(),
+                  let window = exactAXWindow(target: target),
+                  let match = uniqueElement(in: window, role: role, label: label) else { return false }
             return AXUIElementPerformAction(match, kAXPressAction as CFString) == .success
+        }
+
+        /// Depth-first element at `ax_<index>`, using the serializer's limits.
+        private static func element(atIndex wanted: Int, in window: AXUIElement) -> AXUIElement? {
+            var counter = 0
+            var found: AXUIElement?
+            func visit(_ element: AXUIElement, depth: Int) {
+                guard found == nil, depth <= NativeElementID.maximumDepth,
+                      counter < NativeElementID.maximumNodes else { return }
+                let index = counter
+                counter += 1
+                if index == wanted { found = element; return }
+                for child in children(of: element) { visit(child, depth: depth + 1) }
+            }
+            visit(window, depth: 0)
+            return found
+        }
+
+        private static func element(target: ComputerUseNativeHostTarget, id: String) -> AXUIElement? {
+            guard AXIsProcessTrusted(),
+                  let index = NativeElementID.index(id),
+                  let window = exactAXWindow(target: target) else { return nil }
+            return element(atIndex: index, in: window)
+        }
+
+        public static func semanticAction(target: ComputerUseNativeHostTarget, elementID: String) -> Bool {
+            guard let match = element(target: target, id: elementID) else { return false }
+            return AXUIElementPerformAction(match, kAXPressAction as CFString) == .success
+        }
+
+        public static func semanticConfirm(target: ComputerUseNativeHostTarget, elementID: String) -> Bool {
+            guard let match = element(target: target, id: elementID),
+                  actionNames(of: match).contains(kAXConfirmAction as String) else { return false }
+            return AXUIElementPerformAction(match, kAXConfirmAction as CFString) == .success
+        }
+
+        public static func isFocusedElement(target: ComputerUseNativeHostTarget, elementID: String) -> Bool {
+            guard let match = element(target: target, id: elementID),
+                  let focused = elementAttribute(
+                    kAXFocusedUIElementAttribute as CFString,
+                    from: AXUIElementCreateApplication(target.pid)
+                  ) else { return false }
+            return CFEqual(match, focused)
+        }
+
+        public static func setValue(
+            target: ComputerUseNativeHostTarget,
+            elementID: String,
+            value: String,
+            allowedRisks: Set<RiskCategory>? = nil
+        ) -> ComputerUseNativeSetValueResult {
+            guard let match = element(target: target, id: elementID) else {
+                return .failed("element_id does not resolve to an element in this window")
+            }
+            return setValue(element: match, value: value, allowedRisks: allowedRisks)
+        }
+
+        public static func semanticConfirm(
+            target: ComputerUseNativeHostTarget,
+            role: String,
+            label: String
+        ) -> Bool {
+            guard AXIsProcessTrusted(),
+                  let window = exactAXWindow(target: target),
+                  let match = uniqueElement(in: window, role: role, label: label),
+                  actionNames(of: match).contains(kAXConfirmAction as String) else { return false }
+            return AXUIElementPerformAction(match, kAXConfirmAction as CFString) == .success
+        }
+
+        public static func isFocusedElement(
+            target: ComputerUseNativeHostTarget,
+            role: String,
+            label: String
+        ) -> Bool {
+            guard AXIsProcessTrusted(),
+                  let window = exactAXWindow(target: target),
+                  let match = uniqueElement(in: window, role: role, label: label),
+                  let focused = elementAttribute(
+                    kAXFocusedUIElementAttribute as CFString,
+                    from: AXUIElementCreateApplication(target.pid)
+                  ) else { return false }
+            return CFEqual(match, focused)
+        }
+
+        private static func actionNames(of element: AXUIElement) -> [String] {
+            var names: CFArray?
+            guard AXUIElementCopyActionNames(element, &names) == .success,
+                  let actions = names as? [String] else { return [] }
+            return actions
+        }
+
+        private static func title(of element: AXUIElement) -> String? {
+            (attribute(kAXTitleAttribute as CFString, from: element) as? String)
+        }
+
+        private static func children(of element: AXUIElement) -> [AXUIElement] {
+            attribute(kAXChildrenAttribute as CFString, from: element).flatMap(axElements(from:)) ?? []
+        }
+
+        /// Sets an AX value without focusing or activating the app. Pop-up
+        /// buttons are opened with AXPress and the matching item is pressed.
+        public static func setValue(
+            target: ComputerUseNativeHostTarget,
+            role: String,
+            label: String,
+            value: String,
+            allowedRisks: Set<RiskCategory>? = nil
+        ) -> ComputerUseNativeSetValueResult {
+            guard AXIsProcessTrusted(),
+                  let window = exactAXWindow(target: target) else { return .failed("AX window unavailable") }
+            guard let element = uniqueElement(in: window, role: role, label: label) else {
+                return .failed("no unique element with this role and label")
+            }
+            return setValue(element: element, value: value, allowedRisks: allowedRisks)
+        }
+
+        private static func setValue(
+            element: AXUIElement, value: String, allowedRisks: Set<RiskCategory>?
+        ) -> ComputerUseNativeSetValueResult {
+            let role = attribute(kAXRoleAttribute as CFString, from: element) as? String ?? ""
+            if role == "AXPopUpButton" {
+                return selectPopUpItem(element, title: value, allowedRisks: allowedRisks)
+            }
+            let converted: CFTypeRef
+            switch role {
+            case "AXSlider", "AXStepper", "AXIncrementor", "AXLevelIndicator":
+                guard let number = Double(value), number.isFinite else {
+                    return .failed("value must be numeric for \(role)")
+                }
+                converted = NSNumber(value: number)
+            case "AXCheckBox", "AXRadioButton", "AXSwitch":
+                guard value == "0" || value == "1" else { return .failed("value must be 0 or 1 for \(role)") }
+                converted = NSNumber(value: Int(value) ?? 0)
+            default:
+                converted = value as CFString
+            }
+            var settable = DarwinBoolean(false)
+            guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+                  settable.boolValue else {
+                return .failed("AXValue is not settable on this element")
+            }
+            let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, converted)
+            return status == .success ? .applied : .failed("AXValue set failed (\(status.rawValue))")
+        }
+
+        private static func selectPopUpItem(
+            _ popUp: AXUIElement,
+            title: String,
+            allowedRisks: Set<RiskCategory>?
+        ) -> ComputerUseNativeSetValueResult {
+            guard AXUIElementPerformAction(popUp, kAXPressAction as CFString) == .success else {
+                return .failed("could not open the pop-up button")
+            }
+            var menu: AXUIElement?
+            let deadline = Date().addingTimeInterval(1.0)
+            while menu == nil, Date() < deadline {
+                menu = children(of: popUp).first {
+                    (attribute(kAXRoleAttribute as CFString, from: $0) as? String) == kAXMenuRole as String
+                }
+                if menu == nil { Thread.sleep(forTimeInterval: 0.02) }
+            }
+            guard let menu else { return .failed("pop-up menu did not open") }
+            let items = children(of: menu).filter {
+                (attribute(kAXRoleAttribute as CFString, from: $0) as? String) == kAXMenuItemRole as String
+            }
+            return NativeRiskGuard.selectPopUpItem(
+                items: items, title: title, titleOf: { self.title(of: $0) }, allowed: allowedRisks,
+                press: { AXUIElementPerformAction($0, kAXPressAction as CFString) == .success },
+                cancel: { _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString) })
+        }
+
+        /// Presses the enabled menu item carrying the chord; works while the
+        /// app is in the background. MOD+A in a focused text field selects all.
+        public static func menuShortcut(
+            target: ComputerUseNativeHostTarget,
+            chord: ComputerUseNativeMenuChord,
+            allowedRisks: Set<RiskCategory>? = nil
+        ) -> ComputerUseNativeMenuShortcutResult {
+            guard AXIsProcessTrusted(), let window = exactAXWindow(target: target) else { return .failed }
+            let app = AXUIElementCreateApplication(target.pid)
+            if chord.isSelectAll, selectAllInFocusedTextField(app: app, window: window) { return .applied }
+            guard let bar = elementAttribute(kAXMenuBarAttribute as CFString, from: app) else { return .failed }
+            let matches = NativeMenuShortcutSearch.enabledMatches(
+                root: bar,
+                chord: chord,
+                attributesOf: { element in
+                    guard let role = attribute(kAXRoleAttribute as CFString, from: element) as? String else { return nil }
+                    let enabled = (attribute(kAXEnabledAttribute as CFString, from: element) as? NSNumber)?.boolValue ?? true
+                    let cmdChar = attribute(kAXMenuItemCmdCharAttribute as CFString, from: element) as? String
+                    let modifiers = (attribute(kAXMenuItemCmdModifiersAttribute as CFString, from: element) as? NSNumber)?.intValue
+                    return (role, enabled, cmdChar, modifiers)
+                },
+                childrenOf: { children(of: $0) }
+            )
+            return NativeRiskGuard.pressShortcutMatch(
+                matches: matches, titleOf: { title(of: $0) }, allowed: allowedRisks,
+                press: { AXUIElementPerformAction($0, kAXPressAction as CFString) == .success })
+        }
+
+        private static func selectAllInFocusedTextField(app: AXUIElement, window: AXUIElement) -> Bool {
+            guard let focused = elementAttribute(kAXFocusedUIElementAttribute as CFString, from: app),
+                  let owner = elementAttribute(kAXWindowAttribute as CFString, from: focused),
+                  sameAXWindow(owner, window),
+                  let role = attribute(kAXRoleAttribute as CFString, from: focused) as? String,
+                  ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role),
+                  let text = attribute(kAXValueAttribute as CFString, from: focused) as? String else { return false }
+            var settable = DarwinBoolean(false)
+            guard AXUIElementIsAttributeSettable(focused, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
+                  settable.boolValue else { return false }
+            var range = CFRange(location: 0, length: text.utf16.count)
+            guard let value = AXValueCreate(.cfRange, &range) else { return false }
+            return AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, value) == .success
         }
 
         public static func uiTree(target: ComputerUseNativeHostTarget) -> String? {
@@ -2413,9 +3297,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             depth: Int,
             budget: inout TreeBudget
         ) -> [String: Any] {
-            guard depth <= 8, budget.nodes < 200 else { return ["truncated": true] }
+            guard depth <= NativeElementID.maximumDepth, budget.nodes < NativeElementID.maximumNodes else {
+                return ["truncated": true]
+            }
+            var result: [String: Any] = ["id": "ax_\(budget.nodes)"]
             budget.nodes += 1
-            var result: [String: Any] = [:]
             if let role = attribute(kAXRoleAttribute as CFString, from: element) as? String { result["role"] = role }
             if let subrole = attribute(kAXSubroleAttribute as CFString, from: element) as? String {
                 result["subrole"] = subrole
@@ -2431,9 +3317,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                !identifier.isEmpty {
                 result["identifier"] = identifier
             }
-            if let value = attribute(kAXValueAttribute as CFString, from: element) as? String, !value.isEmpty {
-                result["value"] = String(value.prefix(512))
+            if let raw = attribute(kAXValueAttribute as CFString, from: element) {
+                if let value = raw as? String, !value.isEmpty {
+                    result["value"] = String(value.prefix(200))
+                } else if let number = raw as? NSNumber, CFGetTypeID(raw) != CFBooleanGetTypeID() {
+                    result["value"] = number.stringValue
+                }
             }
+            let actions = actionNames(of: element)
+            if !actions.isEmpty { result["actions"] = actions }
             if let children = attribute(kAXChildrenAttribute as CFString, from: element)
                     .flatMap(axElements(from:)),
                !children.isEmpty {

@@ -88,6 +88,8 @@ public struct JevDecision: Sendable {
         public var alternatives: [Alternative] = []
         /// Jev's complete/consequential/authorized estimates for the chosen option.
         public var signals: [String: Double] = [:]
+        /// Chosen probability minus the best runner-up probability.
+        public var margin: Double? = nil
 
         public func jsonObject() -> [String: Any] {
             var result: [String: Any] = ["mode": "jev", "operation": operation, "probability": probability, "confidence": confidence]
@@ -96,6 +98,7 @@ public struct JevDecision: Sendable {
             if let reason { result["reason"] = reason }
             if !alternatives.isEmpty { result["alternatives"] = alternatives.map { $0.jsonObject() } }
             if !signals.isEmpty { result["signals"] = signals }
+            if let margin { result["margin"] = margin }
             return result
         }
     }
@@ -126,11 +129,22 @@ public struct JevDecision: Sendable {
         self.transport = transport
     }
 
-    public func advise(goal: String, observation: String) async throws -> Proposal {
-        if goal.range(of: #"(?i)\b(password|passcode|api[_-]?key|access[_-]?token|secret|one.time.code|otp)\b"#,
-                      options: .regularExpression) != nil {
+    private static func treeText(_ text: Substring) -> Substring {
+        guard let ocr = text.range(of: "\nocr: ") else { return text }
+        return text[..<ocr.lowerBound]
+    }
+
+    public func advise(
+        goal rawGoal: String, observation: String, allowedRisks: Set<RiskCategory> = [], secrets: [String] = [],
+        minConfidence: Double = 0, minMargin: Double = 0
+    ) async throws -> Proposal {
+        let redactor = SecretRedactor(secrets: secrets)
+        if redactor.isEmpty, rawGoal.range(
+            of: #"(?i)\b(password|passcode|api[_-]?key|access[_-]?token|secret|one.time.code|otp)\b"#,
+            options: .regularExpression) != nil {
             throw JevDecisionError.unavailable("Goal may contain credentials; Jev was not contacted")
         }
+        let goal = redactor.redact(rawGoal)
         guard !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               goal.count <= 2_000,
               let marker = observation.range(of: "\nui_tree: "),
@@ -140,7 +154,7 @@ public struct JevDecision: Sendable {
               status["is_on_screen"] as? Bool == true,
               status["is_minimized"] as? Bool == false,
               (status["permissions"] as? [String: Bool])?["accessibility"] == true,
-              let treeData = observation[marker.upperBound...].data(using: .utf8),
+              let treeData = Self.treeText(observation[marker.upperBound...]).data(using: .utf8),
               let tree = try? JSONSerialization.jsonObject(with: treeData) as? [String: Any] else {
             throw JevDecisionError.invalidObservation
         }
@@ -155,7 +169,8 @@ public struct JevDecision: Sendable {
         elements = elements.filter { element in
             !element.label.isEmpty && element.label.count <= 100 && scrub(element.label) == element.label
                 && counts["\(element.role):\(element.label)"] == 1
-        }
+                && RiskCategory.categories(element.label).isSubset(of: allowedRisks)
+        }.map { Element(role: $0.role, label: redactor.redact($0.label), aliases: $0.aliases) }
         var targets: [String: Element] = [:]
         var criteria: [String: String] = [
             "WAIT": "Observe again without acting",
@@ -213,9 +228,11 @@ public struct JevDecision: Sendable {
                     ?? Alternative(operation: id, role: nil, label: nil, probability: value)
             }
         let signals = ["complete": complete, "consequential": consequential, "authorized": authorized]
+        let margin = probability - (probabilities.filter { $0.key != choice }.values.max() ?? 0)
         func proposal(_ operation: String, _ target: Element? = nil, reason: String? = nil) -> Proposal {
             Proposal(operation: operation, role: target?.role, label: target?.label, probability: probability,
-                     confidence: confidence, reason: reason, alternatives: alternatives, signals: signals)
+                     confidence: confidence, reason: reason, alternatives: alternatives, signals: signals,
+                     margin: margin)
         }
         if choice == "BLOCKED" { return proposal("BLOCKED", reason: "Jev found no safe action") }
         if choice == "WAIT" { return proposal("WAIT") }
@@ -225,11 +242,7 @@ public struct JevDecision: Sendable {
                 : proposal("BLOCKED", reason: "Completion evidence below threshold")
         }
         guard let target = targets[choice] else { throw JevDecisionError.invalidResponse }
-        let sensitiveLabel = target.label.range(
-            of: #"(?i)\b(send|submit|delete|remove|buy|purchase|pay|share|publish|transfer|erase|quit|close)\b"#,
-            options: .regularExpression
-        ) != nil
-        let material = consequential >= 0.5 || sensitiveLabel
+        let material = consequential >= 0.5 || RiskCategory.classify(target.label) != nil
         guard probability >= (material ? 0.85 : 0.55),
               confidence >= (material ? 0.75 : 0.35),
               !material || authorized >= 0.90 else {
@@ -238,10 +251,16 @@ public struct JevDecision: Sendable {
                 : "Choice below \(material ? "material" : "routine") confidence threshold"
             return proposal("BLOCKED", reason: why)
         }
+        guard Subtask.gate(confidence: confidence, margin: margin, minConfidence: minConfidence, minMargin: minMargin) else {
+            let why = confidence < minConfidence
+                ? "Confidence \(confidence) below min_confidence \(minConfidence)"
+                : "Margin \(margin) below min_margin \(minMargin)"
+            return proposal("NEEDS_AGENT", reason: why)
+        }
         return proposal("click_element", target)
     }
 
-    public func localFallback(observation: String) throws -> [String: Any] {
+    public func localFallback(observation: String, allowedRisks: Set<RiskCategory> = []) throws -> [String: Any] {
         guard let marker = observation.range(of: "\nui_tree: "),
               let header = observation[..<marker.lowerBound].data(using: .utf8),
               let status = try? JSONSerialization.jsonObject(with: header) as? [String: Any],
@@ -249,7 +268,7 @@ public struct JevDecision: Sendable {
               status["is_on_screen"] as? Bool == true,
               status["is_minimized"] as? Bool == false,
               (status["permissions"] as? [String: Bool])?["accessibility"] == true,
-              let treeData = observation[marker.upperBound...].data(using: .utf8),
+              let treeData = Self.treeText(observation[marker.upperBound...]).data(using: .utf8),
               let tree = try? JSONSerialization.jsonObject(with: treeData) as? [String: Any] else {
             throw JevDecisionError.invalidObservation
         }
@@ -261,6 +280,7 @@ public struct JevDecision: Sendable {
         let candidates = elements.filter { element in
             !element.label.isEmpty && element.label.count <= 100 && scrub(element.label) == element.label
                 && counts["\(element.role):\(element.label)"] == 1
+                && RiskCategory.categories(element.label).isSubset(of: allowedRisks)
         }.prefix(100).map { ["role": $0.role, "label": $0.label] }
         return [
             "mode": "llm",

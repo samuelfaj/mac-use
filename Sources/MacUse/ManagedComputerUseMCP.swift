@@ -109,6 +109,7 @@ public struct ManagedComputerUseMCP: Sendable {
         "list_windows",
         "get_ui_tree",
         "jev_decide",
+        "run_subtask",
         "doctor",
         "cua_status",
     ]
@@ -117,6 +118,8 @@ public struct ManagedComputerUseMCP: Sendable {
         leftClickTool,
         typeTool,
         "click_element",
+        "set_value",
+        "menu_shortcut",
         "restore_window",
         "right_click",
         "mouse_move",
@@ -134,6 +137,7 @@ public struct ManagedComputerUseMCP: Sendable {
     private let browser: any ComputerUseToolBackend
     private let jevAvailable: @Sendable () -> Bool
     private let cua: CuaSpaces
+    private let jevTransport: any JevTransport
 
     public init(
         queue: ComputerUseHostQueue = .shared,
@@ -143,7 +147,8 @@ public struct ManagedComputerUseMCP: Sendable {
         jevAvailable: @escaping @Sendable () -> Bool = {
             TypeSafeJevTransport.isConfigured()
         },
-        cua: CuaSpaces = CuaSpaces()
+        cua: CuaSpaces = CuaSpaces(),
+        jevTransport: any JevTransport = TypeSafeJevTransport()
     ) {
         self.queue = queue
         self.backend = backend
@@ -151,6 +156,7 @@ public struct ManagedComputerUseMCP: Sendable {
         self.browser = browser
         self.jevAvailable = jevAvailable
         self.cua = cua
+        self.jevTransport = jevTransport
     }
 
     public func handle(_ line: String) async -> String? {
@@ -171,7 +177,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information.",
+                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized; set_value sets a field/slider/checkbox/pop-up by role and label, and menu_shortcut presses the enabled menu item bound to a chord (MOD+S), both without focusing the window. Minimized windows and hidden apps allow get_ui_tree, click_element and set_value; input-event tools need restore_window first. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information. For a multi-step goal with a Jev key, run_subtask runs a bounded observe-decide-act loop over your inputs, verification and constraints and returns SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; secret_inputs are typed but never shown to Jev or returned.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -192,22 +198,76 @@ public struct ManagedComputerUseMCP: Sendable {
             }
             let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
             let targetPID = Self.targetPID(from: arguments)
+            if name == "run_subtask" {
+                guard let target = ComputerUseNativeHostBackend.exactInt32(arguments["target_pid"]),
+                      let window = ComputerUseNativeHostBackend.exactUInt32(arguments["target_window_id"]),
+                      target > 0, window > 0 else {
+                    return errorReply(id: id, code: -32602, message: "target_pid and target_window_id are required")
+                }
+                let subtask: Subtask
+                do {
+                    subtask = try Subtask.parse(arguments)
+                } catch {
+                    let text = SecretRedactor(rawArguments: arguments).redact(String(describing: error))
+                    let result = ComputerUseToolResult(text: text, isError: true)
+                    return reply(id: id, result: ["content": result.jsonContent(), "isError": true])
+                }
+                guard jevAvailable() else {
+                    let result = ComputerUseToolResult(
+                        text: "run_subtask needs a Jev key; use jev_decide for LLM-driven steps", isError: true)
+                    return reply(id: id, result: ["content": result.jsonContent(), "isError": true])
+                }
+                let output = await SubtaskRunner(backend: backend, transport: jevTransport, queue: queue).run(
+                    target: ComputerUseNativeHostTarget(pid: target, windowID: window), subtask: subtask,
+                    dryRun: subtask.dryRun, logPath: arguments["log_path"] as? String)
+                let result = ComputerUseToolResult(text: encode(output) ?? "{}")
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": false])
+            }
             if name == "jev_decide" {
                 guard let goal = arguments["goal"] as? String, !goal.isEmpty else {
                     return errorReply(id: id, code: -32602, message: "goal is required")
                 }
+                var allowedRisks = Set<RiskCategory>()
+                var minConfidence = 0.0
+                var minMargin = 0.0
+                do {
+                    if let raw = arguments["allowed_risks"] {
+                        guard let names = raw as? [String] else {
+                            throw SubtaskError.invalid(field: "allowed_risks", reason: "must be an array of strings")
+                        }
+                        for name in names {
+                            guard let category = RiskCategory(rawValue: name) else {
+                                throw SubtaskError.invalid(field: "allowed_risks", reason: "'\(name)' is not one of delete, send, purchase, close")
+                            }
+                            allowedRisks.insert(category)
+                        }
+                    }
+                    for (field, key) in [("min_confidence", 0), ("min_margin", 1)] {
+                        guard let raw = arguments[field] else { continue }
+                        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                              number.doubleValue.isFinite, (0...1).contains(number.doubleValue) else {
+                            throw SubtaskError.invalid(field: field, reason: "must be a number between 0 and 1")
+                        }
+                        if key == 0 { minConfidence = number.doubleValue } else { minMargin = number.doubleValue }
+                    }
+                } catch {
+                    let result = ComputerUseToolResult(text: String(describing: error), isError: true)
+                    return reply(id: id, result: ["content": result.jsonContent(), "isError": true])
+                }
                 do {
                     let observation = try await queue.withExclusive(kind: .observation, targetPID: targetPID) {
-                        await backend.invoke(name: "get_ui_tree", arguments: arguments)
+                        await backend.invoke(name: "get_ui_tree", arguments: arguments.merging(["ocr": "never"]) { _, new in new })
                     }
                     guard !observation.isError, let text = observation.content.first?.text else {
                         return reply(id: id, result: ["content": observation.jsonContent(), "isError": true])
                     }
                     let outputFromModel: [String: Any]
                     if jevAvailable() {
-                        outputFromModel = try await jev.advise(goal: goal, observation: text).jsonObject()
+                        outputFromModel = try await jev.advise(
+                            goal: goal, observation: text, allowedRisks: allowedRisks,
+                            minConfidence: minConfidence, minMargin: minMargin).jsonObject()
                     } else {
-                        outputFromModel = try jev.localFallback(observation: text)
+                        outputFromModel = try jev.localFallback(observation: text, allowedRisks: allowedRisks)
                     }
                     var output = outputFromModel
                     if let prefix = text.range(of: "\nui_tree: "),
@@ -274,11 +334,17 @@ public struct ManagedComputerUseMCP: Sendable {
         case "list_windows":
             return "List on-screen windows, optionally filtered by bundle id."
         case "get_ui_tree":
-            return "Accessibility tree for a window. Contains private screen text; use jev_decide for redacted Jev guidance."
+            return "Accessibility tree for a window; each actionable element has an ax_<n> id for click_element and set_value. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line of recognized text after the tree. Contains private screen text; use jev_decide for redacted Jev guidance."
         case "jev_decide":
             return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
+        case "run_subtask":
+            return "Requires a Jev key. Run a bounded loop (max_actions) that observes the window, asks Jev for one semantic step (CLICK, SET_VALUE, HOTKEY, WAIT, DONE, BLOCKED or NEEDS_INPUT), executes it natively and reobserves. Literal text comes only from inputs; secret_inputs are typed but never sent to Jev or returned. Risky controls (delete, send, purchase, close) are withheld unless in allowed_risks. Stops with SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; stops on human activity."
         case "click_element":
-            return "Press an AX element by role and label in the exact background target."
+            return "Press an AX element in the exact background target, by element_id (ax_<n> from the get_ui_tree of the observation whose token is passed) or by role and label."
+        case "set_value":
+            return "Set the AX value of the unique element with this role and label in the exact background target: text for fields and combo boxes, a number for sliders, 0/1 for checkboxes, or an item title for AXPopUpButton (opened and pressed via AX). Optional submit_key ENTER or TAB is posted only if the exact window is already focused (ENTER falls back to AXConfirm). Waits for the UI to settle and returns a fresh observation with settle_ms and settled."
+        case "menu_shortcut":
+            return "Press the enabled menu bar item bound to a keyboard chord such as MOD+S (MOD=Cmd, CTRL, ALT, SHIFT) via AX, without focusing the window. MOD+A in a focused text field selects all text. Fails with \"no enabled menu item has this shortcut\". Returns a fresh observation with settle_ms and settled."
         case "restore_window":
             return "Explicitly restore and focus the exact PID/window; requires its fresh state token and returns a new observation. Use that new token for subsequent actions."
         case "browser_open":
@@ -352,8 +418,31 @@ public struct ManagedComputerUseMCP: Sendable {
                 "properties": targeting.merging([
                     "role": ["type": "string"],
                     "label": ["type": "string"],
+                    "element_id": ["type": "string", "description": "ax_<n> id from get_ui_tree of the observation whose token is passed; use instead of role+label."],
                 ]) { _, new in new },
-                "required": ["target_pid", "target_window_id", "expected_state_token", "role", "label"],
+                "required": ["target_pid", "target_window_id", "expected_state_token"],
+            ]
+        case "set_value":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "role": ["type": "string"],
+                    "label": ["type": "string"],
+                    "element_id": ["type": "string", "description": "ax_<n> id from get_ui_tree of the observation whose token is passed; use instead of role+label."],
+                    "value": ["type": "string"],
+                    "submit_key": ["type": "string", "enum": ["ENTER", "TAB"]],
+                    "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]], "description": "When present, refuse a menu item whose title names a risk category not listed."],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "value"],
+            ]
+        case "menu_shortcut":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "chord": ["type": "string", "description": "Modifiers MOD (Cmd), CTRL, ALT, SHIFT joined by + with one key, e.g. MOD+S or MOD+SHIFT+Z."],
+                    "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]], "description": "When present, refuse a menu item whose title names a risk category not listed."],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "chord"],
             ]
         case "right_click", "mouse_move":
             return [
@@ -395,10 +484,44 @@ public struct ManagedComputerUseMCP: Sendable {
         case "jev_decide":
             return [
                 "type": "object",
-                "properties": targeting.merging(["goal": ["type": "string", "description": "Original user goal; sanitized before sending to Jev."]]) { _, new in new },
+                "properties": targeting.merging([
+                    "goal": ["type": "string", "description": "Original user goal; sanitized before sending to Jev."],
+                    "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]], "description": "Risk categories of controls the goal explicitly authorizes; other risky controls are withheld."],
+                    "min_confidence": ["type": "number", "description": "0-1; below this Jev's answer returns NEEDS_AGENT."],
+                    "min_margin": ["type": "number", "description": "0-1; minimum lead over the runner-up choice."],
+                ]) { _, new in new },
                 "required": ["target_pid", "target_window_id", "goal"],
             ]
-        case "doctor", "get_ui_tree", "cursor_position":
+        case "run_subtask":
+            return [
+                "type": "object",
+                "properties": [
+                    "target_pid": ["type": "integer"],
+                    "target_window_id": ["type": "integer"],
+                    "goal": ["type": "string"],
+                    "verification": ["type": "array", "items": ["type": "string"], "description": "Criteria that must all be visibly true before SUBTASK_COMPLETE."],
+                    "constraints": ["type": "array", "items": ["type": "string"]],
+                    "inputs": ["type": "object", "description": "Named literal values (string, number or boolean) the loop may type; the model never invents text."],
+                    "max_actions": ["type": "integer", "minimum": 1, "description": "Action budget; default 30."],
+                    "shortcuts": ["type": "object", "description": "Extra chords such as {\"MOD+S\": \"Save the document\"} mapped to a description.", "additionalProperties": ["type": "string"]],
+                    "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]]],
+                    "secret_inputs": ["type": "array", "items": ["type": "string"], "description": "Keys of inputs whose values are typed but redacted from Jev, results and logs."],
+                    "min_confidence": ["type": "number"],
+                    "min_margin": ["type": "number"],
+                    "dry_run": ["type": "boolean", "description": "Stop with DRY_RUN and planned_action after the first validated decision."],
+                    "log_path": ["type": "string", "description": "Append one redacted JSONL line per decision."],
+                ],
+                "required": ["target_pid", "target_window_id", "goal", "verification"],
+            ]
+        case "get_ui_tree":
+            return [
+                "type": "object",
+                "properties": targeting.merging([
+                    "ocr": ["type": "string", "enum": ["auto", "always", "never"]],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id"],
+            ]
+        case "doctor", "cursor_position":
             return [
                 "type": "object",
                 "properties": targeting,

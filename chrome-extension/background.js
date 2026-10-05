@@ -18,6 +18,14 @@ export function pageOperation(operation, args) {
     }
     return true;
   };
+  const elementCovered = element => {
+    const rect = element.getBoundingClientRect();
+    const top = document.elementFromPoint?.(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (!top || top === element || element.contains(top)) return false;
+    // A shadow host is how elementFromPoint reports its own shadow content.
+    return element.getRootNode?.().host !== top;
+  };
+  const liveRegion = element => ['status', 'alert'].includes(element.getAttribute('role')) || element.getAttribute('aria-live') !== null;
   const elementSignature = element => ({
     role: element.getAttribute('role') || element.tagName.toLowerCase(),
     name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
@@ -43,6 +51,7 @@ export function pageOperation(operation, args) {
     if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) {
       throw new Error('The element is disabled.');
     }
+    if (element && args.action !== 'scroll' && elementCovered(element)) throw new Error('element is covered');
     switch (args.action) {
       case 'click':
         element.click();
@@ -51,7 +60,13 @@ export function pageOperation(operation, args) {
       case 'type': {
         const text = String(args.text ?? '');
         element.focus({preventScroll: true});
-        if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+        if (element.tagName === 'SELECT') {
+          if (args.action !== 'fill') throw new Error('Use fill to choose an option of a select.');
+          const option = Array.from(element.options).find(item => item.value === text)
+            || Array.from(element.options).find(item => item.text.trim() === text.trim());
+          if (!option || option.disabled) throw new Error('No enabled option matches the given value or text.');
+          element.selectedIndex = option.index;
+        } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
           if (element.readOnly) throw new Error('The field is read-only.');
           const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype
             : element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype;
@@ -75,16 +90,100 @@ export function pageOperation(operation, args) {
   }
   const token = crypto.randomUUID();
   const refs = new Map();
-  const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable]'))
-    .filter(elementVisible).slice(0, 200).map((element, index) => {
+  let extraLive = 0;
+  const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable],[aria-live]'))
+    .filter(elementVisible)
+    .filter((element, index) => index < 200 || (liveRegion(element) && ++extraLive <= 20)).map((element, index) => {
       const ref = `${token}.${index}`;
       const signature = elementSignature(element);
       refs.set(ref, {element, signature});
-      return {ref, role: signature.role, name: signature.name, value: signature.value};
+      const item = {ref, role: signature.role, name: signature.name, value: signature.value};
+      if (element.tagName === 'SELECT') {
+        item.options = Array.from(element.options).slice(0, 50).map(option => ({value: option.value, text: option.text.trim()}));
+        item.selected = element.value;
+      }
+      if (elementCovered(element)) item.covered = true;
+      if (liveRegion(element)) {
+        const rect = element.getBoundingClientRect();
+        if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= globalThis.innerHeight || rect.left >= globalThis.innerWidth) item.offscreen = true;
+      }
+      return item;
     });
   globalThis.__macUseSnapshot = refs;
   return {url: location.href, title: document.title, ready: document.readyState === 'complete',
     text: (document.body?.innerText || '').slice(0, 16000), elements};
+}
+
+// Runs in the page's MAIN world, the only world that sees the page's fetch/XHR.
+// Counts requests started after this call; older ones (polling, streams) are ignored.
+export function settleBegin() {
+  const g = globalThis;
+  if (!g.__macUseNet) {
+    const net = {seq: 0, marker: 0, open: new Set(), lastMutation: 0, observer: undefined};
+    const track = () => {
+      const id = ++net.seq;
+      net.open.add(id);
+      return () => net.open.delete(id);
+    };
+    const nativeFetch = g.fetch;
+    if (typeof nativeFetch === 'function') {
+      g.fetch = function (...fetchArgs) {
+        const done = track();
+        let promise;
+        try { promise = nativeFetch.apply(this, fetchArgs); } catch (error) { done(); throw error; }
+        promise.then(done, done);
+        return promise;
+      };
+    }
+    const nativeSend = g.XMLHttpRequest?.prototype?.send;
+    if (nativeSend) {
+      g.XMLHttpRequest.prototype.send = function (...sendArgs) {
+        const done = track();
+        this.addEventListener('loadend', done, {once: true});
+        try { return nativeSend.apply(this, sendArgs); } catch (error) { done(); throw error; }
+      };
+    }
+    g.__macUseNet = net;
+  }
+  const net = g.__macUseNet;
+  net.marker = net.seq;
+  net.lastMutation = performance.now();
+  net.observer?.disconnect();
+  net.observer = new MutationObserver(() => { net.lastMutation = performance.now(); });
+  net.observer.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+}
+
+export function settlePoll() {
+  const net = globalThis.__macUseNet;
+  if (!net) return {pending: 0, idle: 1e9};
+  let pending = 0;
+  for (const id of net.open) if (id > net.marker) pending++;
+  return {pending, idle: performance.now() - net.lastMutation};
+}
+
+const settleLimits = {pollMs: 50, quietMs: 150, idleCapMs: 2000, pendingCapMs: 10000};
+
+// Polled from the service worker because timers in a background tab are throttled.
+export async function settle(session, limits = settleLimits) {
+  const start = Date.now();
+  let lastPending = start;
+  for (;;) {
+    await new Promise(resolve => setTimeout(resolve, limits.pollMs));
+    const tab = await ownedTab(session);
+    let poll;
+    try {
+      [{result: poll}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, world: 'MAIN', func: settlePoll});
+    } catch {
+      poll = {pending: 1, idle: 0};
+    }
+    const now = Date.now();
+    const pending = (poll?.pending ?? 0) + (tab.status === 'loading' ? 1 : 0);
+    if (pending > 0) lastPending = now;
+    if (pending === 0 && (poll?.idle ?? 1e9) >= limits.quietMs) return {settle_ms: now - start, settled: true};
+    if (now - start >= limits.pendingCapMs || (pending === 0 && now - lastPending >= limits.idleCapMs)) {
+      return {settle_ms: now - start, settled: false};
+    }
+  }
 }
 
 async function groupTab(tab) {
@@ -168,14 +267,21 @@ export async function handleRequest(request) {
   const tab = await ownedTab(session);
   if (tab.status === 'loading') throw new Error('The page is still loading. Take a browser_snapshot again shortly.');
   validURL(tab.url);
-  const results = await chrome.scripting.executeScript({
-    target: {tabId: tab.id}, world: 'ISOLATED', func: pageOperation, args: [operation, args]
-  });
+  const run = (world, func, funcArgs) => chrome.scripting.executeScript({target: {tabId: tab.id}, world, func, args: funcArgs});
+  if (operation === 'browser_act') await run('MAIN', settleBegin);
+  let results = await run('ISOLATED', pageOperation, [operation, args]);
+  let settled = {};
+  if (operation === 'browser_act') {
+    if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
+    settled = await settle(session);
+    // Refs from the pre-settle snapshot are replaced by one that shows the settled page.
+    results = await run('ISOLATED', pageOperation, ['browser_snapshot', {}]);
+  }
   if (sessions.get(session)?.takenOver || (await chrome.tabs.get(tab.id)).active) {
     throw new Error('human_activity: you selected this tab. No result will be returned.');
   }
   if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
-  return results[0].result;
+  return {...results[0].result, ...settled};
 }
 
 function badge(text, title) {

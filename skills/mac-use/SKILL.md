@@ -40,6 +40,16 @@ Call `cua_status` before touching the user's Mac. If it reports `available: true
 - Pointer/keyboard fallbacks require the exact window already focused. Do not activate another window merely to bypass that guard. `restore_window` changes focus and is only for an explicit user request; use the fresh token it returns. Stop when human activity or target validation rejects an action.
 - Close a task-created native window through its freshly observed close control, or a supported exact-window close action. There is no generic native `close_window` MCP tool. Do not quit an application that also contains the user's windows, discard the user's unsaved work, or use blind global shortcuts.
 
+## Multi-step and settling
+
+- `click_element` and `set_value` take `element_id` (`ax_<n>` from the `get_ui_tree` whose token you pass) or `role` plus `label`, never both. `set_value` fills fields, sliders, checkboxes and pop-ups; `menu_shortcut` presses the enabled menu item bound to a chord like `MOD+S`.
+- `get_ui_tree` takes `ocr: auto|always|never`; OCR text follows the tree on an `ocr:` line and needs Screen Recording. `jev_decide` always requests `ocr: never`.
+- Minimized windows and hidden apps allow only the AX tools (`get_ui_tree`, `click_element`, `set_value`, `menu_shortcut`); pointer and key tools need an explicit `restore_window` request.
+- Mutations wait for the UI to settle and return a fresh observation with `settle_ms` and `settled`; reobserve if `settled` is false.
+- `jev_decide` accepts `allowed_risks` (`delete`, `send`, `purchase`, `close`), `min_confidence` and `min_margin`. Pass `allowed_risks` only for categories the user's goal explicitly authorizes; other risky controls are withheld.
+- `run_subtask` (needs a Jev key) runs a bounded observe-decide-act loop. Fields: `goal`, `verification` (non-empty), `constraints`, `inputs`, `max_actions` (default 30), `shortcuts`, `allowed_risks`, `secret_inputs` (typed but never shown to Jev or returned), `dry_run`, `min_confidence`, `min_margin`. Statuses: `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT` (supply the missing input), `NEEDS_AGENT` (take over, e.g. a risky control), `DRY_RUN`. Verify the result yourself before reporting completion.
+- Chrome: `browser_act` waits for the page to settle and returns a fresh snapshot, so earlier `ref`s are stale. Select options and fill are supported, covered elements are refused, and live-region changes are reported.
+
 ## Other resources and final cleanup
 
 - Close task-created dialogs, windows, and tabs. Stop only task-owned processes, servers, recordings, or automation sessions, using their exact identities. Do not stop shared MCP/native hosts or pre-existing applications.

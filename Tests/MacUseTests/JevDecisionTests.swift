@@ -74,6 +74,8 @@ final class JevDecisionTests: XCTestCase {
     ui_tree: {"role":"AXWindow","value":"private message","children":[{"role":"AXButton","title":"Send"},{"role":"AXTextField","value":"secret text"}]}
     """
 
+    private var safeObservation: String { observation.replacingOccurrences(of: "\"Send\"", with: "\"Save\"") }
+
     func testJevCredentialsSelectCorrectTypedProviderAndModel() throws {
         XCTAssertNil(TypeSafeJevTransport.route(environment: [:]))
         let openRouter = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key"]))
@@ -119,7 +121,7 @@ final class JevDecisionTests: XCTestCase {
 
     func testJevOnlyReceivesAllowlistedLabelsNeverWindowTokenOrFieldValues() async throws {
         let transport = TestJev()
-        let proposal = try await JevDecision(transport: transport).advise(goal: "Click Send", observation: observation)
+        let proposal = try await JevDecision(transport: transport).advise(goal: "Click Send", observation: observation, allowedRisks: [.send])
         XCTAssertEqual(proposal.operation, "click_element")
         XCTAssertEqual(proposal.role, "AXButton")
         let captured = await transport.request()
@@ -158,23 +160,23 @@ final class JevDecisionTests: XCTestCase {
 
     func testConsequentialClickRequiresExplicitAuthorization() async throws {
         let blocked = TestJev(consequential: 0.95, authorization: 0.2)
-        let result = try await JevDecision(transport: blocked).advise(goal: "Find Send", observation: observation)
+        let result = try await JevDecision(transport: blocked).advise(goal: "Find Send", observation: observation, allowedRisks: [.send])
         XCTAssertEqual(result.operation, "BLOCKED")
         let permitted = TestJev(consequential: 0.95, authorization: 0.99)
-        let allowed = try await JevDecision(transport: permitted).advise(goal: "Send", observation: observation)
+        let allowed = try await JevDecision(transport: permitted).advise(goal: "Send", observation: observation, allowedRisks: [.send])
         XCTAssertEqual(allowed.operation, "click_element")
     }
 
     func testMaterialButtonRequiresStrongGatesEvenIfModelMisclassifiesIt() async throws {
         let transport = TestJev(probability: 0.70, confidence: 0.8, consequential: 0, authorization: 0.99)
-        let result = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation)
+        let result = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation, allowedRisks: [.send])
         XCTAssertEqual(result.operation, "BLOCKED")
     }
 
     func testJevAdviceCarriesAlternativesSignalsAndBlockReasonForSessionLLM() async throws {
         // "Send" is material by label, so 0.70 is below the material threshold.
         let transport = TestJev(probability: 0.70, confidence: 0.8, consequential: 0, authorization: 0.99)
-        let json = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation).jsonObject()
+        let json = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation, allowedRisks: [.send]).jsonObject()
         XCTAssertEqual(json["mode"] as? String, "jev")
         XCTAssertEqual(json["operation"] as? String, "BLOCKED")
         // A blocked choice must explain why, so the session LLM asks the user instead of guessing.
@@ -189,7 +191,7 @@ final class JevDecisionTests: XCTestCase {
 
     func testDoneNeedsIndependentCompletionEvidence() async throws {
         let transport = TestJev(selected: "DONE", completion: 0.5)
-        let result = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation)
+        let result = try await JevDecision(transport: transport).advise(goal: "Send", observation: observation, allowedRisks: [.send])
         XCTAssertEqual(result.operation, "BLOCKED")
     }
 
@@ -197,11 +199,11 @@ final class JevDecisionTests: XCTestCase {
         let lock = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-tests-\(UUID().uuidString)/computer-use.lock")
         let handler = ManagedComputerUseMCP(
             queue: ComputerUseHostQueue(lockURL: lock),
-            backend: ObservationBackend(observation: observation),
+            backend: ObservationBackend(observation: safeObservation),
             jev: JevDecision(transport: TestJev()),
             jevAvailable: { true }
         )
-        let call = #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
+        let call = #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Save","target_pid":123,"target_window_id":9}}}"#
         let reply = await handler.handle(call)
         let response = try XCTUnwrap(reply)
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
@@ -218,11 +220,11 @@ final class JevDecisionTests: XCTestCase {
         let transport = TestJev()
         let handler = ManagedComputerUseMCP(
             queue: ComputerUseHostQueue(lockURL: lock),
-            backend: ObservationBackend(observation: observation),
+            backend: ObservationBackend(observation: safeObservation),
             jev: JevDecision(transport: transport),
             jevAvailable: { false }
         )
-        let call = #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
+        let call = #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Save","target_pid":123,"target_window_id":9}}}"#
         let reply = await handler.handle(call)
         let response = try XCTUnwrap(reply)
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
@@ -234,7 +236,7 @@ final class JevDecisionTests: XCTestCase {
         XCTAssertEqual(fallback["mode"] as? String, "llm")
         XCTAssertEqual(fallback["operation"] as? String, "DEFER_TO_LLM")
         XCTAssertEqual(fallback["expected_state_token"] as? String, "private-token")
-        XCTAssertEqual((fallback["candidates"] as? [[String: String]])?.first?["label"], "Send")
+        XCTAssertEqual((fallback["candidates"] as? [[String: String]])?.first?["label"], "Save")
         XCTAssertFalse(text.contains("private message"))
         XCTAssertFalse(text.contains("secret text"))
         let captured = await transport.request()
@@ -245,11 +247,11 @@ final class JevDecisionTests: XCTestCase {
         let lock = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-tests-\(UUID().uuidString)/computer-use.lock")
         let handler = ManagedComputerUseMCP(
             queue: ComputerUseHostQueue(lockURL: lock),
-            backend: ObservationBackend(observation: observation),
+            backend: ObservationBackend(observation: safeObservation),
             jev: JevDecision(transport: FailingJev()),
             jevAvailable: { true }
         )
-        let call = #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Send","target_pid":123,"target_window_id":9}}}"#
+        let call = #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Click Save","target_pid":123,"target_window_id":9}}}"#
         let reply = await handler.handle(call)
         let response = try XCTUnwrap(reply)
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
@@ -270,7 +272,7 @@ final class JevDecisionTests: XCTestCase {
             with: #"{"role":"AXButton","title":"Delete","description":"Send"},{"role":"AXButton","title":"Send"}"#
         )
         let transport = TestJev(selected: "BLOCKED")
-        _ = try await JevDecision(transport: transport).advise(goal: "Send", observation: ambiguous)
+        _ = try await JevDecision(transport: transport).advise(goal: "Send", observation: ambiguous, allowedRisks: [.send, .delete])
         let captured = await transport.request()
         let request = try XCTUnwrap(captured)
         let state = request["state"] as! [String: Any]
@@ -284,10 +286,69 @@ final class JevDecisionTests: XCTestCase {
             of: "{\"role\":\"AXTextField\",\"value\":\"secret text\"}",
             with: "{\"role\":\"AXButton\",\"title\":\"Send\"}")
         let transport = TestJev(selected: "BLOCKED")
-        _ = try await JevDecision(transport: transport).advise(goal: "Send", observation: duplicated)
+        _ = try await JevDecision(transport: transport).advise(goal: "Send", observation: duplicated, allowedRisks: [.send])
         let captured = await transport.request()
         let request = try XCTUnwrap(captured)
         let state = request["state"] as! [String: Any]
         XCTAssertTrue((state["visibleElements"] as! [[String: String]]).isEmpty)
+    }
+
+    func testRiskyTargetWithheldFromJevUnlessCategoryAllowed() async throws {
+        let withheld = TestJev(selected: "BLOCKED")
+        _ = try await JevDecision(transport: withheld).advise(goal: "Send", observation: observation)
+        let firstCaptured = await withheld.request()
+        let first = try XCTUnwrap(firstCaptured)
+        XCTAssertTrue(((first["state"] as! [String: Any])["visibleElements"] as! [[String: String]]).isEmpty)
+
+        let wrongCategory = TestJev(selected: "BLOCKED")
+        _ = try await JevDecision(transport: wrongCategory).advise(goal: "Send", observation: observation, allowedRisks: [.delete])
+        let secondCaptured = await wrongCategory.request()
+        let second = try XCTUnwrap(secondCaptured)
+        XCTAssertTrue(((second["state"] as! [String: Any])["visibleElements"] as! [[String: String]]).isEmpty)
+
+        let allowed = TestJev(selected: "BLOCKED")
+        _ = try await JevDecision(transport: allowed).advise(goal: "Send", observation: observation, allowedRisks: [.send])
+        let thirdCaptured = await allowed.request()
+        let third = try XCTUnwrap(thirdCaptured)
+        XCTAssertEqual(((third["state"] as! [String: Any])["visibleElements"] as! [[String: String]]).count, 1)
+    }
+
+    func testLocalFallbackWithholdsRiskyCandidatesUnlessAllowed() throws {
+        let jev = JevDecision(transport: TestJev())
+        XCTAssertTrue((try jev.localFallback(observation: observation)["candidates"] as! [[String: String]]).isEmpty)
+        let allowed = try jev.localFallback(observation: observation, allowedRisks: [.send])
+        XCTAssertEqual((allowed["candidates"] as! [[String: String]]).first?["label"], "Send")
+    }
+
+    func testSecretsAllowGoalButAreRedactedBeforeTransport() async throws {
+        let transport = TestJev()
+        let proposal = try await JevDecision(transport: transport).advise(
+            goal: "Type password hunter2 then click Save", observation: safeObservation, secrets: ["hunter2"])
+        XCTAssertEqual(proposal.operation, "click_element")
+        let requestCaptured = await transport.request()
+        let request = try XCTUnwrap(requestCaptured)
+        let payload = String(data: try JSONSerialization.data(withJSONObject: request), encoding: .utf8)!
+        XCTAssertFalse(payload.contains("hunter2"))
+        XCTAssertTrue(payload.contains("[secret]"))
+    }
+
+    func testMarginBelowMinimumReturnsNeedsAgentWithReason() async throws {
+        // Runner-up gets 0.30 so margin is 0.40.
+        let transport = TestJev(probability: 0.70, confidence: 0.9, consequential: 0, authorization: 0.99)
+        let blocked = try await JevDecision(transport: transport).advise(
+            goal: "Save", observation: safeObservation, minMargin: 0.5)
+        XCTAssertEqual(blocked.operation, "NEEDS_AGENT")
+        XCTAssertTrue(try XCTUnwrap(blocked.reason).contains("min_margin"))
+        XCTAssertEqual(try XCTUnwrap(blocked.margin), 0.4, accuracy: 1e-9)
+        XCTAssertEqual(blocked.jsonObject()["margin"] as? Double ?? 0, 0.4, accuracy: 1e-9)
+
+        let passes = try await JevDecision(transport: transport).advise(
+            goal: "Save", observation: safeObservation, minMargin: 0.39)
+        XCTAssertEqual(passes.operation, "click_element")
+
+        let lowConfidence = try await JevDecision(transport: transport).advise(
+            goal: "Save", observation: safeObservation, minConfidence: 0.95)
+        XCTAssertEqual(lowConfidence.operation, "NEEDS_AGENT")
+        XCTAssertTrue(try XCTUnwrap(lowConfidence.reason).contains("min_confidence"))
     }
 }
