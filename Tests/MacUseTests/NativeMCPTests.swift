@@ -71,6 +71,18 @@ private struct SemanticSearchTestNode {
 }
 
 final class NativeMCPTests: XCTestCase {
+    // A wedged ScreenCaptureKit callback must not hold the per-PID lock forever.
+    func testCaptureDeadlineReturnsNilWhenOperationNeverFinishes() async {
+        let started = Date()
+        let value = await ComputerUseNativeHostBackend.NativePlatform.withDeadline(seconds: 0.2) { () async -> Int in
+            await withCheckedContinuation { (_: CheckedContinuation<Int, Never>) in }
+        }
+        XCTAssertNil(value)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        let fast = await ComputerUseNativeHostBackend.NativePlatform.withDeadline(seconds: 5) { 7 }
+        XCTAssertEqual(fast, 7)
+    }
+
     func testRestoreDoesNotActivateAppWhenExactWindowFocusSetupFails() {
         var activated = false
         var rolledBack = false

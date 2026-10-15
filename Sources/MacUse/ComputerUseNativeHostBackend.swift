@@ -2617,15 +2617,50 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             )
         }
 
-        private static func shareableContent() async -> SCShareableContent? {
-            await withCheckedContinuation { continuation in
-                SCShareableContent.getExcludingDesktopWindows(
-                    false,
-                    onScreenWindowsOnly: false
-                ) { content, _ in
-                    continuation.resume(returning: content)
+        private final class ResumeOnce<T>: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<T?, Never>?
+
+            init(_ continuation: CheckedContinuation<T?, Never>) {
+                self.continuation = continuation
+            }
+
+            func resume(_ value: T?) {
+                lock.lock()
+                let pending = continuation
+                continuation = nil
+                lock.unlock()
+                pending?.resume(returning: value)
+            }
+        }
+
+        /// ScreenCaptureKit callbacks can never fire when replayd wedges; that
+        /// held the per-PID lock forever. Returns nil after `seconds` without
+        /// waiting for the abandoned operation.
+        static func withDeadline<T: Sendable>(
+            seconds: Double,
+            _ operation: @escaping @Sendable () async -> T
+        ) async -> T? {
+            await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+                let gate = ResumeOnce(continuation)
+                let work = Task { gate.resume(await operation()) }
+                Task {
+                    try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                    work.cancel()
+                    gate.resume(nil)
                 }
             }
+        }
+
+        static let shareableContentTimeoutSeconds = 5.0
+        static let captureImageTimeoutSeconds = 10.0
+
+        private static func shareableContent() async -> SCShareableContent? {
+            // Capture requires an on-screen window; listing only those is ~10x faster.
+            let content = await withDeadline(seconds: shareableContentTimeoutSeconds) {
+                try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            }
+            return content ?? nil
         }
 
         private static func captureImage(
@@ -2633,10 +2668,20 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             configuration: SCStreamConfiguration
         ) async -> Result<CGImage, CaptureImageFailure> {
             do {
-                return .success(try await SCScreenshotManager.captureImage(
-                    contentFilter: filter,
-                    configuration: configuration
-                ))
+                let result = await withDeadline(seconds: captureImageTimeoutSeconds) {
+                    do {
+                        return Result<CGImage, Error>.success(try await SCScreenshotManager.captureImage(
+                            contentFilter: filter,
+                            configuration: configuration
+                        ))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+                guard let result else {
+                    return .failure(.screenshotManager(domain: "mac-use", code: -1, description: "screen_capture_timeout"))
+                }
+                return .success(try result.get())
             } catch {
                 let nsError = error as NSError
                 let reason = String(describing: error)
