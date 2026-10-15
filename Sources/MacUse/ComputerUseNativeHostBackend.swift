@@ -2110,8 +2110,10 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
         }
 
+        static let timeoutDomain = "mac-use.capture-timeout"
+
         static func allowsQuartzFallback(domain: String, code: Int) -> Bool {
-            domain == SCStreamErrorDomain && code == -3811
+            (domain == SCStreamErrorDomain && code == -3811) || domain == timeoutDomain
         }
 
         struct QuartzWindowSnapshot: Equatable {
@@ -2434,7 +2436,17 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult {
-            await capture(target: target, region: CaptureZoomContext.region)
+            if screenCaptureStalled() {
+                return .unavailable("screen_capture_stalled_retry_later")
+            }
+            let region = CaptureZoomContext.region
+            guard let result = await withDeadline(seconds: captureTotalTimeoutSeconds, {
+                await capture(target: target, region: region)
+            }) else {
+                markScreenCaptureStalled()
+                return .unavailable("screen_capture_timeout")
+            }
+            return result
         }
 
         static func capture(
@@ -2442,7 +2454,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             region: CGRect?
         ) async -> ComputerUseNativeCaptureResult {
             guard let content = await shareableContent() else {
-                return .unavailable("shareable_content_unavailable")
+                return encodeQuartz(target: target, region: region, after: .quartzFallback("shareable_content_unavailable"))
             }
             guard let window = content.windows.first(where: {
                 $0.windowID == CGWindowID(target.windowID)
@@ -2504,6 +2516,43 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             case .failure(let reason):
                 return .unavailable(reason.description)
             }
+        }
+
+        private static func encodeQuartz(
+            target: ComputerUseNativeHostTarget,
+            region: CGRect?,
+            after reason: CaptureImageFailure
+        ) -> ComputerUseNativeCaptureResult {
+            switch quartzWindowImage(target: target, after: reason) {
+            case .success(let image):
+                switch ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: region) {
+                case .success(let capture), .quartzFallback(let capture):
+                    return .quartzFallback(capture)
+                case .unavailable(let failure):
+                    return .unavailable(failure)
+                }
+            case .failure(let failure):
+                return .unavailable(failure.description)
+            }
+        }
+
+        // replayd/WindowServer can stop answering one client indefinitely; fail
+        // fast for a while instead of paying the full timeout on every call.
+        static let captureTotalTimeoutSeconds = 12.0
+        static let screenCaptureRetrySeconds = 30.0
+        private static let stallLock = NSLock()
+        private static var stalledUntil = Date.distantPast
+
+        static func markScreenCaptureStalled() {
+            stallLock.lock()
+            stalledUntil = Date().addingTimeInterval(screenCaptureRetrySeconds)
+            stallLock.unlock()
+        }
+
+        static func screenCaptureStalled() -> Bool {
+            stallLock.lock()
+            defer { stallLock.unlock() }
+            return Date() < stalledUntil
         }
 
         private static func quartzWindowImage(
@@ -2653,7 +2702,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         static let shareableContentTimeoutSeconds = 5.0
-        static let captureImageTimeoutSeconds = 10.0
+        static let captureImageTimeoutSeconds = 5.0
 
         private static func shareableContent() async -> SCShareableContent? {
             // Capture requires an on-screen window; listing only those is ~10x faster.
@@ -2679,7 +2728,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     }
                 }
                 guard let result else {
-                    return .failure(.screenshotManager(domain: "mac-use", code: -1, description: "screen_capture_timeout"))
+                    return .failure(.screenshotManager(domain: timeoutDomain, code: -1, description: "screen_capture_timeout"))
                 }
                 return .success(try result.get())
             } catch {

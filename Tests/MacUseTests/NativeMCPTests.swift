@@ -83,6 +83,16 @@ final class NativeMCPTests: XCTestCase {
         XCTAssertEqual(fast, 7)
     }
 
+    // After a ScreenCaptureKit timeout the screenshot falls back to Quartz and
+    // skips ScreenCaptureKit for a while instead of failing every call slowly.
+    func testCaptureTimeoutFallsBackToQuartzAndMarksStall() {
+        typealias Platform = ComputerUseNativeHostBackend.NativePlatform
+        XCTAssertTrue(Platform.allowsQuartzFallback(domain: Platform.timeoutDomain, code: -1))
+        XCTAssertFalse(Platform.allowsQuartzFallback(domain: "other", code: -1))
+        Platform.markScreenCaptureStalled()
+        XCTAssertTrue(Platform.screenCaptureStalled())
+    }
+
     func testRestoreDoesNotActivateAppWhenExactWindowFocusSetupFails() {
         var activated = false
         var rolledBack = false
