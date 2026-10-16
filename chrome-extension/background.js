@@ -9,109 +9,115 @@ let requests = Promise.resolve();
 // or exposing references to page scripts. Every action checks visibility again
 // inside the tab to close the race with the background service worker.
 export function pageOperation(operation, args) {
-  const elementVisible = element => {
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    for (let current = element; current; current = current.parentElement) {
-      const style = getComputedStyle(current);
-      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
-    }
-    return true;
-  };
-  const elementCovered = element => {
-    const rect = element.getBoundingClientRect();
-    const top = document.elementFromPoint?.(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    if (!top || top === element || element.contains(top)) return false;
-    // A shadow host is how elementFromPoint reports its own shadow content.
-    return element.getRootNode?.().host !== top;
-  };
-  const liveRegion = element => ['status', 'alert'].includes(element.getAttribute('role')) || element.getAttribute('aria-live') !== null;
-  const elementSignature = element => ({
-    role: element.getAttribute('role') || element.tagName.toLowerCase(),
-    name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
-    type: element.type || '',
-    disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-    readOnly: Boolean(element.readOnly),
-    href: element.getAttribute('href') || '',
-    value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
-  });
-  if (document.visibilityState !== 'hidden') {
-    throw new Error('human_activity: the tab is visible; select another tab before continuing.');
-  }
-  if (operation === 'browser_act') {
-    const snapshot = globalThis.__macUseSnapshot;
-    const entry = snapshot?.get(args.ref);
-    const element = entry?.element;
-    if (args.action !== 'scroll' || args.ref) {
-      if (!element?.isConnected || !elementVisible(element)
-          || JSON.stringify(elementSignature(element)) !== JSON.stringify(entry.signature)) {
-        throw new Error('stale_reference: take a new browser_snapshot.');
+  // executeScript drops thrown messages; with reportErrors the reason is returned instead.
+  try {
+    const elementVisible = element => {
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = element; current; current = current.parentElement) {
+        const style = getComputedStyle(current);
+        if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
       }
-    }
-    if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) {
-      throw new Error('The element is disabled.');
-    }
-    if (element && args.action !== 'scroll' && elementCovered(element)) throw new Error('element is covered');
-    switch (args.action) {
-      case 'click':
-        element.click();
-        break;
-      case 'fill':
-      case 'type': {
-        const text = String(args.text ?? '');
-        element.focus({preventScroll: true});
-        if (element.tagName === 'SELECT') {
-          if (args.action !== 'fill') throw new Error('Use fill to choose an option of a select.');
-          const option = Array.from(element.options).find(item => item.value === text)
-            || Array.from(element.options).find(item => item.text.trim() === text.trim());
-          if (!option || option.disabled) throw new Error('No enabled option matches the given value or text.');
-          element.selectedIndex = option.index;
-        } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
-          if (element.readOnly) throw new Error('The field is read-only.');
-          const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype
-            : element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype;
-          const value = args.action === 'type' ? element.value + text : text;
-          Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, value);
-        } else if (element.isContentEditable) {
-          element.textContent = (args.action === 'type' ? element.textContent : '') + text;
-        } else {
-          throw new Error('The element is not an editable field.');
-        }
-        element.dispatchEvent(new Event('input', {bubbles: true}));
-        element.dispatchEvent(new Event('change', {bubbles: true}));
-        break;
-      }
-      case 'scroll':
-        (element || window).scrollBy({left: args.delta_x ?? 0, top: args.delta_y ?? 600, behavior: 'instant'});
-        break;
-      default:
-        throw new Error('Unsupported browser action.');
-    }
-  }
-  const token = crypto.randomUUID();
-  const refs = new Map();
-  let extraLive = 0;
-  const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable],[aria-live]'))
-    .filter(elementVisible)
-    .filter((element, index) => index < 200 || (liveRegion(element) && ++extraLive <= 20)).map((element, index) => {
-      const ref = `${token}.${index}`;
-      const signature = elementSignature(element);
-      refs.set(ref, {element, signature});
-      const item = {ref, role: signature.role, name: signature.name, value: signature.value};
-      if (element.tagName === 'SELECT') {
-        item.options = Array.from(element.options).slice(0, 50).map(option => ({value: option.value, text: option.text.trim()}));
-        item.selected = element.value;
-      }
-      if (elementCovered(element)) item.covered = true;
-      if (liveRegion(element)) {
-        const rect = element.getBoundingClientRect();
-        if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= globalThis.innerHeight || rect.left >= globalThis.innerWidth) item.offscreen = true;
-      }
-      return item;
+      return true;
+    };
+    const elementCovered = element => {
+      const rect = element.getBoundingClientRect();
+      const top = document.elementFromPoint?.(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (!top || top === element || element.contains(top)) return false;
+      // A shadow host is how elementFromPoint reports its own shadow content.
+      return element.getRootNode?.().host !== top;
+    };
+    const liveRegion = element => ['status', 'alert'].includes(element.getAttribute('role')) || element.getAttribute('aria-live') !== null;
+    const elementSignature = element => ({
+      role: element.getAttribute('role') || element.tagName.toLowerCase(),
+      name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
+      type: element.type || '',
+      disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+      readOnly: Boolean(element.readOnly),
+      href: element.getAttribute('href') || '',
+      value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
     });
-  globalThis.__macUseSnapshot = refs;
-  return {url: location.href, title: document.title, ready: document.readyState === 'complete',
-    text: (document.body?.innerText || '').slice(0, 16000), elements};
+    if (document.visibilityState !== 'hidden') {
+      throw new Error('human_activity: the tab is visible; select another tab before continuing.');
+    }
+    if (operation === 'browser_act') {
+      const snapshot = globalThis.__macUseSnapshot;
+      const entry = snapshot?.get(args.ref);
+      const element = entry?.element;
+      if (args.action !== 'scroll' || args.ref) {
+        if (!entry || !element?.isConnected || !elementVisible(element)
+            || JSON.stringify(elementSignature(element)) !== JSON.stringify(entry.signature)) {
+          throw new Error('stale_reference: take a new browser_snapshot.');
+        }
+      }
+      if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) {
+        throw new Error('The element is disabled.');
+      }
+      if (element && args.action !== 'scroll' && elementCovered(element)) throw new Error('element is covered');
+      switch (args.action) {
+        case 'click':
+          element.click();
+          break;
+        case 'fill':
+        case 'type': {
+          const text = String(args.text ?? '');
+          element.focus({preventScroll: true});
+          if (element.tagName === 'SELECT') {
+            if (args.action !== 'fill') throw new Error('Use fill to choose an option of a select.');
+            const option = Array.from(element.options).find(item => item.value === text)
+              || Array.from(element.options).find(item => item.text.trim() === text.trim());
+            if (!option || option.disabled) throw new Error('No enabled option matches the given value or text.');
+            element.selectedIndex = option.index;
+          } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+            if (element.readOnly) throw new Error('The field is read-only.');
+            const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype
+              : element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype;
+            const value = args.action === 'type' ? element.value + text : text;
+            Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, value);
+          } else if (element.isContentEditable) {
+            element.textContent = (args.action === 'type' ? element.textContent : '') + text;
+          } else {
+            throw new Error('The element is not an editable field.');
+          }
+          element.dispatchEvent(new Event('input', {bubbles: true}));
+          element.dispatchEvent(new Event('change', {bubbles: true}));
+          break;
+        }
+        case 'scroll':
+          (element || window).scrollBy({left: args.delta_x ?? 0, top: args.delta_y ?? 600, behavior: 'instant'});
+          break;
+        default:
+          throw new Error('Unsupported browser action.');
+      }
+    }
+    const token = crypto.randomUUID();
+    const refs = new Map();
+    let extraLive = 0;
+    const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable],[aria-live]'))
+      .filter(elementVisible)
+      .filter((element, index) => index < 200 || (liveRegion(element) && ++extraLive <= 20)).map((element, index) => {
+        const ref = `${token}.${index}`;
+        const signature = elementSignature(element);
+        refs.set(ref, {element, signature});
+        const item = {ref, role: signature.role, name: signature.name, value: signature.value};
+        if (element.tagName === 'SELECT') {
+          item.options = Array.from(element.options).slice(0, 50).map(option => ({value: option.value, text: option.text.trim()}));
+          item.selected = element.value;
+        }
+        if (elementCovered(element)) item.covered = true;
+        if (liveRegion(element)) {
+          const rect = element.getBoundingClientRect();
+          if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= globalThis.innerHeight || rect.left >= globalThis.innerWidth) item.offscreen = true;
+        }
+        return item;
+      });
+    globalThis.__macUseSnapshot = refs;
+    return {url: location.href, title: document.title, ready: document.readyState === 'complete',
+      text: (document.body?.innerText || '').slice(0, 16000), elements};
+  } catch (error) {
+    if (args?.reportErrors) return {error: String(error?.message || error)};
+    throw error;
+  }
 }
 
 // Runs in the page's MAIN world, the only world that sees the page's fetch/XHR.
@@ -269,14 +275,23 @@ export async function handleRequest(request) {
     if (args.action !== 'scroll' && typeof args.ref !== 'string') throw new Error('An element ref from browser_snapshot is required.');
     if (['delta_x', 'delta_y'].some(key => args[key] !== undefined && !Number.isFinite(args[key]))) throw new Error('Scroll distances must be finite.');
   }
-  const tab = await ownedTab(session);
-  if (tab.status === 'loading') throw new Error('The page is still loading. Take a browser_snapshot again shortly.');
+  let tab = await ownedTab(session);
+  if (tab.status === 'loading') {
+    if (operation === 'browser_act') throw new Error('The page is still loading. Take a browser_snapshot again shortly.');
+    const deadline = Date.now() + 10000;
+    while (tab.status === 'loading' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      tab = await ownedTab(session);
+    }
+    if (tab.status === 'loading') throw new Error('The page did not finish loading within 10 seconds.');
+  }
   if (new URL(tab.url).protocol !== 'about:') validURL(tab.url);
   const run = (world, func, funcArgs) => executePageScript({target: {tabId: tab.id}, world, func, args: funcArgs});
   if (operation === 'browser_act') await run('MAIN', settleBegin);
-  let results = await run('ISOLATED', pageOperation, [operation, args]);
+  let results = await run('ISOLATED', pageOperation, [operation, operation === 'browser_act' ? {...args, reportErrors: true} : args]);
   let settled = {};
   if (operation === 'browser_act') {
+    if (results[0]?.result?.error) throw new Error(results[0].result.error);
     if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
     settled = await settle(session);
     // Refs from the pre-settle snapshot are replaced by one that shows the settled page.
@@ -343,32 +358,38 @@ const extendedTools = ['browser_navigate', 'browser_click', 'browser_type', 'bro
 
 // Runs in the same isolated world as snapshot references.
 export function resolveTarget(args) {
-  if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
-  const element = args.ref ? globalThis.__macUseSnapshot?.get(args.ref)?.element
-    : args.css_selector ? document.querySelector(args.css_selector) : undefined;
-  if ((args.ref || args.css_selector) && !element?.isConnected) throw new Error('stale_reference: take a new browser_snapshot.');
-  if (!element) {
-    if (!Number.isFinite(args.x) || !Number.isFinite(args.y) || args.x < 0 || args.y < 0 || args.x >= innerWidth || args.y >= innerHeight) throw new Error('A ref or finite viewport x,y is required.');
-    return {x: args.x, y: args.y};
+  // executeScript drops thrown messages; with reportErrors the reason is returned instead.
+  try {
+    if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
+    const element = args.ref ? globalThis.__macUseSnapshot?.get(args.ref)?.element
+      : args.css_selector ? document.querySelector(args.css_selector) : undefined;
+    if ((args.ref || args.css_selector) && !element?.isConnected) throw new Error('stale_reference: take a new browser_snapshot.');
+    if (!element) {
+      if (!Number.isFinite(args.x) || !Number.isFinite(args.y) || args.x < 0 || args.y < 0 || args.x >= innerWidth || args.y >= innerHeight) throw new Error('A ref or finite viewport x,y is required.');
+      return {x: args.x, y: args.y};
+    }
+    const entry = args.ref && globalThis.__macUseSnapshot.get(args.ref);
+    const signature = {
+      role: element.getAttribute('role') || element.tagName.toLowerCase(),
+      name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
+      type: element.type || '', disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+      readOnly: Boolean(element.readOnly), href: element.getAttribute('href') || '',
+      value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
+    };
+    if (entry && JSON.stringify(signature) !== JSON.stringify(entry.signature)) throw new Error('stale_reference: take a new browser_snapshot.');
+    if (element.disabled || element.getAttribute('aria-disabled') === 'true') throw new Error('The element is disabled.');
+    element.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) throw new Error('The element is not visible.');
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    const top = document.elementFromPoint(x, y);
+    if (top && top !== element && !element.contains(top) && element.getRootNode()?.host !== top) throw new Error('element is covered');
+    if (args.focus) element.focus({preventScroll: true});
+    return {x, y, href: element.href};
+  } catch (error) {
+    if (args.reportErrors) return {error: String(error?.message || error)};
+    throw error;
   }
-  const entry = args.ref && globalThis.__macUseSnapshot.get(args.ref);
-  const signature = {
-    role: element.getAttribute('role') || element.tagName.toLowerCase(),
-    name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
-    type: element.type || '', disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-    readOnly: Boolean(element.readOnly), href: element.getAttribute('href') || '',
-    value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
-  };
-  if (entry && JSON.stringify(signature) !== JSON.stringify(entry.signature)) throw new Error('stale_reference: take a new browser_snapshot.');
-  if (element.disabled || element.getAttribute('aria-disabled') === 'true') throw new Error('The element is disabled.');
-  element.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
-  const rect = element.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) throw new Error('The element is not visible.');
-  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
-  const top = document.elementFromPoint(x, y);
-  if (top && top !== element && !element.contains(top) && element.getRootNode()?.host !== top) throw new Error('element is covered');
-  if (args.focus) element.focus({preventScroll: true});
-  return {x, y, href: element.href};
 }
 
 export function pageQuery(args) {
@@ -479,27 +500,50 @@ async function extendedRequest(operation, session, args) {
       return snapshot({result: result.result?.value ?? null});
     } else {
       const point = async values => {
-        const point = await run(resolveTarget, [values]);
+        const point = await run(resolveTarget, [{...values, reportErrors: true}]);
+        if (point?.error) throw new Error(point.error);
         if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y) || point.x < 0 || point.y < 0) throw new Error('A ref or finite viewport x,y is required.');
         return {x: point.x, y: point.y};
+      };
+      const trustedInput = (reset = false) => run(() => {
+        if (!globalThis.__macUseInputListenerInstalled) {
+          for (const type of ['mousedown', 'wheel', 'keydown'])
+            window.addEventListener(type, () => { globalThis.__macUseInputSeen = (globalThis.__macUseInputSeen || 0) + 1; }, true);
+          globalThis.__macUseInputListenerInstalled = true;
+        }
+        if (reset) globalThis.__macUseInputSeen = 0;
+        return globalThis.__macUseInputSeen || 0;
+      }, [], 'MAIN');
+      // Unfocused background tabs drop presses and keys; emulate focus only while dispatching,
+      // after resolveTarget has checked visibility (emulation makes the tab look visible).
+      const focused = async dispatch => {
+        await command('Emulation.setFocusEmulationEnabled', {enabled: true});
+        try { await dispatch(); } finally { await command('Emulation.setFocusEmulationEnabled', {enabled: false}); }
       };
       const mouse = (type, position, extra = {}) => command('Input.dispatchMouseEvent', {type, ...position, ...extra});
       const click = async (position, button, count) => {
         if (!['left', 'right', 'middle'].includes(button) || ![1, 2, 3].includes(count)) throw new Error('Invalid button or click_count.');
         for (let n = 1; n <= count; n++) {
+          await mouse('mouseMoved', position);
           await mouse('mousePressed', position, {button, clickCount: n});
           await mouse('mouseReleased', position, {button, clickCount: n});
         }
       };
+      const checksTrustedInput = operation === 'browser_type' ? (args.mode ?? 'insert_text') === 'keystrokes' : !(operation === 'browser_pointer' && args.action === 'hover');
+      if (checksTrustedInput) await trustedInput(true);
       if (operation === 'browser_type') {
         if (args.ref || args.css_selector) await point({...args, focus: true});
         if ((args.mode ?? 'insert_text') === 'insert_text') await command('Input.insertText', {text: args.text});
-        else for (const key of args.text) {
-          await command('Input.dispatchKeyEvent', {type: 'keyDown', key, text: key});
-          await command('Input.dispatchKeyEvent', {type: 'keyUp', key});
-        }
+        else await focused(async () => {
+          for (const key of args.text) {
+            await command('Input.dispatchKeyEvent', {type: 'keyDown', key, text: key});
+            await command('Input.dispatchKeyEvent', {type: 'keyUp', key});
+          }
+        });
       } else {
         const position = await point(args);
+        const destination = operation === 'browser_pointer' && args.action === 'drag' ? await point({ref: args.to_ref, x: args.to_x, y: args.to_y}) : null;
+        await focused(async () => {
         if (operation === 'browser_click') await click(position, args.button ?? 'left', args.click_count ?? 1);
         else if (args.action === 'hover') await mouse('mouseMoved', position);
         else if (args.action === 'right_click' || args.action === 'double_click') await click(position, args.action === 'right_click' ? 'right' : 'left', args.action === 'double_click' ? 2 : 1);
@@ -508,12 +552,13 @@ async function extendedRequest(operation, session, args) {
           if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('Scroll distances must be finite.');
           await mouse('mouseWheel', position, {deltaX, deltaY});
         } else {
-          const destination = await point({ref: args.to_ref, x: args.to_x, y: args.to_y});
           await mouse('mousePressed', position, {button: 'left', clickCount: 1});
           try { await mouse('mouseMoved', destination, {button: 'left', buttons: 1}); }
           finally { await mouse('mouseReleased', destination, {button: 'left', clickCount: 1}); }
         }
+        });
       }
+      if (checksTrustedInput && await trustedInput() === 0) throw new Error('trusted_input_not_delivered: Chrome dropped trusted input to this background tab; use browser_act (click/fill/type) or browser_type mode insert_text.');
     }
     if (state.dialog) return {dialog: state.dialog};
     await settle(session);

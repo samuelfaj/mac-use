@@ -197,6 +197,17 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func actionPoint(_ arguments: [String: Any], pid: Int32?, windowID: UInt32?) -> CGPoint? {
         let pair = (arguments["coordinate"] as? [NSNumber]).flatMap { $0.count == 2 ? ($0[0].doubleValue, $0[1].doubleValue) : nil }
             ?? ((arguments["x"] as? NSNumber).flatMap { x in (arguments["y"] as? NSNumber).map { (x.doubleValue, $0.doubleValue) } })
+        if pair == nil, let pid, let windowID, let id = arguments["element_id"] as? String,
+           let element = ComputerUseNativeHostBackend.NativePlatform.element(
+               target: ComputerUseNativeHostTarget(pid: pid, windowID: windowID), id: id) {
+            var origin = CGPoint.zero, size = CGSize.zero
+            let position = ComputerUseNativeHostBackend.NativePlatform.attribute(kAXPositionAttribute as CFString, from: element)
+            let extent = ComputerUseNativeHostBackend.NativePlatform.attribute(kAXSizeAttribute as CFString, from: element)
+            if let position, let extent, CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(extent) == AXValueGetTypeID(),
+               AXValueGetValue(position as! AXValue, .cgPoint, &origin), AXValueGetValue(extent as! AXValue, .cgSize, &size) {
+                return CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+            }
+        }
         guard let (x, y) = pair else { return nil }
         if arguments["scope"] as? String == "desktop" { return CGPoint(x: x, y: y) }
         guard let pid, let windowID,

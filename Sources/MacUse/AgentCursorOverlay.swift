@@ -18,6 +18,9 @@ final class AgentCursorOverlay {
     func move(session: String, point: CGPoint, theme: String, color: String, duration: Double, hideAfter: Double) async {
         if !Self.configured {
             NSApplication.shared.setActivationPolicy(.accessory)
+            // The stdio server runs a bare RunLoop, not NSApp.run(); without this the
+            // window server never shows the panel.
+            NSApplication.shared.finishLaunching()
             Self.configured = true
         }
         let panel: NSPanel

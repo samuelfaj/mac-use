@@ -124,6 +124,7 @@ globalThis.chrome = {
     async update(groupId, changes) { groupUpdateCalls.push({groupId, changes}); return {id: groupId, ...changes}; },
   },
   scripting: {async executeScript({func, args = []}) {
+    if (func.toString().includes('__macUseInputSeen')) return [{result: 1}];
     if (func.name === 'pageQuery') return [{result: args[0].action === 'get_text' ? 'page text' : [{tag: 'a', attributes: {href: '/next'}}]}];
     if (func.name === 'resolveTarget') return [{result: {x: args[0].x ?? 10, y: args[0].y ?? 20, href: 'https://example.com/file'}}];
     if (activateOnScript) activated.fire({tabId: currentTabId});
@@ -253,6 +254,23 @@ test('disconnect best-effort closes owned inactive tabs and leaves selected tabs
   assert.equal(tabs.has(unattended.tabId), false);
   assert.equal(tabs.has(selected.tabId), true);
   activeTabId = undefined;
+});
+
+test('browser_snapshot waits for a loading tab instead of failing', async () => {
+  const {session, tabId} = await openSession(70);
+  const get = chrome.tabs.get;
+  let gets = 0;
+  chrome.tabs.get = async id => {
+    const tab = await get.call(chrome.tabs, id);
+    if (id === tabId && gets++ < 2) return {...tab, status: 'loading'};
+    return {...tab, status: 'complete'};
+  };
+  try {
+    assert.deepEqual(await handleRequest({operation: 'browser_snapshot', session}), {url: 'https://example.com/', elements: []});
+    assert.ok(gets >= 3);
+  } finally {
+    chrome.tabs.get = get;
+  }
 });
 
 test('activation while a snapshot is in flight prevents the result from being returned', async () => {
@@ -508,24 +526,50 @@ test('trusted click and typing dispatch debugger input and detach after calls', 
   const {session, tabId} = await openSession(102);
   debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_click', session, arguments: {x: 31, y: 42, button: 'right', click_count: 2}});
-  assert.deepEqual(debuggerCalls.filter(c => c.method === 'Input.dispatchMouseEvent').map(c => c.params), [
+  const mouseCalls = debuggerCalls.filter(c => c.method === 'Input.dispatchMouseEvent');
+  const mouseFirst = debuggerCalls.indexOf(mouseCalls[0]);
+  const mouseLast = debuggerCalls.indexOf(mouseCalls.at(-1));
+  assert.deepEqual(debuggerCalls.slice(0, mouseFirst).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: true}]);
+  assert.deepEqual(debuggerCalls.slice(mouseLast + 1).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: false}]);
+  assert.deepEqual(mouseCalls.map(c => c.params), [
+    {type: 'mouseMoved', x: 31, y: 42},
     {type: 'mousePressed', x: 31, y: 42, button: 'right', clickCount: 1},
     {type: 'mouseReleased', x: 31, y: 42, button: 'right', clickCount: 1},
+    {type: 'mouseMoved', x: 31, y: 42},
     {type: 'mousePressed', x: 31, y: 42, button: 'right', clickCount: 2},
     {type: 'mouseReleased', x: 31, y: 42, button: 'right', clickCount: 2},
   ]);
   assert.equal(attachedTabs.has(tabId), false);
   await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 1, y: 2, button: 'bad'}}), /Invalid button/);
+  debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_type', session, arguments: {ref: 'ref', text: 'hello', mode: 'insert_text'}});
   assert.deepEqual(debuggerCalls.find(c => c.method === 'Input.insertText').params, {text: 'hello'});
+  assert.equal(debuggerCalls.some(c => c.method === 'Emulation.setFocusEmulationEnabled' && c.params.enabled === true), false);
   debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_type', session, arguments: {text: 'a😀', mode: 'keystrokes'}});
-  assert.deepEqual(debuggerCalls.filter(c => c.method === 'Input.dispatchKeyEvent').map(c => c.params), [
+  const keyCalls = debuggerCalls.filter(c => c.method === 'Input.dispatchKeyEvent');
+  const keyFirst = debuggerCalls.indexOf(keyCalls[0]);
+  const keyLast = debuggerCalls.indexOf(keyCalls.at(-1));
+  assert.deepEqual(debuggerCalls.slice(0, keyFirst).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: true}]);
+  assert.deepEqual(debuggerCalls.slice(keyLast + 1).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: false}]);
+  assert.deepEqual(keyCalls.map(c => c.params), [
     {type: 'keyDown', key: 'a', text: 'a'}, {type: 'keyUp', key: 'a'},
     {type: 'keyDown', key: '😀', text: '😀'}, {type: 'keyUp', key: '😀'},
   ]);
   assert.equal(attachedTabs.has(tabId), false);
   await handleRequest({operation: 'browser_close', session});
+});
+test('dropped trusted input errors and detaches debugger', async () => {
+  const {session, tabId} = await openSession(103);
+  const original = chrome.scripting.executeScript;
+  chrome.scripting.executeScript = async ({func, ...options}) => func.toString().includes('__macUseInputSeen') ? [{result: 0}] : original({func, ...options});
+  try {
+    await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 31, y: 42}}), /trusted_input_not_delivered: Chrome dropped trusted input to this background tab/);
+    assert.equal(attachedTabs.has(tabId), false);
+  } finally {
+    chrome.scripting.executeScript = original;
+    await handleRequest({operation: 'browser_close', session});
+  }
 });
 
 test('dialog listener retains debugger until accept or dismiss', async () => {

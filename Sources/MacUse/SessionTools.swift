@@ -216,7 +216,10 @@ private actor SessionState {
         return Self.result(recordingState())
     }
     func move(arguments: [String: Any], point: CGPoint?) async {
-        guard let id = arguments["session"] as? String, var s = sessions[id], s.enabled, let point, point.x.isFinite, point.y.isFinite else { return }
+        // Without an explicit session, mouse actions still show a default agent cursor.
+        let id = arguments["session"] as? String ?? "default"
+        if arguments["session"] == nil, sessions[id] == nil { sessions[id] = Session() }
+        guard var s = sessions[id], s.enabled, let point, point.x.isFinite, point.y.isFinite else { return }
         let distance = s.point.map { hypot($0.x - point.x, $0.y - point.y) } ?? 0
         s.point = point; sessions[id] = s
         guard overlayEnabled else { return }

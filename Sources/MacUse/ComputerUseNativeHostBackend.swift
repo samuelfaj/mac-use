@@ -2152,6 +2152,17 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 [.optionAll, .excludeDesktopElements],
                 kCGNullWindowID
             ) as? [[String: Any]] ?? []
+            var axFrames: [Int32: [CGRect]] = [:]
+            func hasAXWindow(pid: Int32, bounds: CGRect) -> Bool {
+                if axFrames[pid] == nil {
+                    let app = AXUIElementCreateApplication(pid)
+                    AXUIElementSetMessagingTimeout(app, 0.5)
+                    let windows = attribute(kAXWindowsAttribute as CFString, from: app)
+                        .flatMap(axElements(from:)) ?? []
+                    axFrames[pid] = windows.compactMap(frame(of:))
+                }
+                return axFrames[pid]!.contains { framesEqual($0, bounds) }
+            }
             return infos.compactMap { info in
                 guard let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
                       let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
@@ -2164,6 +2175,10 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 let bounds = (info[kCGWindowBounds as String] as? NSDictionary)
                     .flatMap { CGRect(dictionaryRepresentation: $0) } ?? .zero
                 let isOnScreen = (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
+                // Off-screen untitled Quartz surfaces without an AX window (e.g. SwiftUI menu-bar
+                // helpers) are not minimized windows; listing them as such misleads agents.
+                if !isOnScreen, (info[kCGWindowName as String] as? String ?? "").isEmpty,
+                   !hasAXWindow(pid: pid, bounds: bounds) { return nil }
                 return ComputerUseNativeWindow(
                     target: .init(pid: pid, windowID: number),
                     title: info[kCGWindowName as String] as? String ?? "",
@@ -2287,10 +2302,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     let readiness = self.readiness
                     lock.unlock()
                     readiness?.wait()
-                    lock.lock()
-                    let result = isReadyForMutation
-                    lock.unlock()
-                    return result
+                    return isReadyForMutation
                 }
                 started = true
                 let ready = DispatchGroup()
@@ -2303,16 +2315,20 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 thread.start()
                 lock.unlock()
                 ready.wait()
-                lock.lock()
-                let result = isReadyForMutation
-                lock.unlock()
-                return result
+                return isReadyForMutation
             }
 
+            /// The tap must observe 2s of input before it can vouch for no recent human
+            /// activity; wait out the remainder (outside the lock) instead of failing.
             private var isReadyForMutation: Bool {
-                guard available, let armedAtNanoseconds else { return false }
+                lock.lock()
+                let armed = available ? armedAtNanoseconds : nil
+                lock.unlock()
+                guard let armed else { return false }
                 let now = DispatchTime.now().uptimeNanoseconds
-                return now >= armedAtNanoseconds && now - armedAtNanoseconds >= 2_000_000_000
+                let elapsed = now >= armed ? now - armed : 0
+                if elapsed < 2_000_000_000 { usleep(useconds_t((2_000_000_000 - elapsed) / 1_000)) }
+                return true
             }
 
             func stop() {

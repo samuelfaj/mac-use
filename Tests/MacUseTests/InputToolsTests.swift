@@ -118,8 +118,45 @@ final class InputToolsTests: XCTestCase {
         effects.scale = { _ in 2 }
         effects.sleep = { _ in }
         effects.axAction = { _, _, _ in false }
+        effects.axPressAt = { _, _ in false }
+        effects.focusedWindow = { _ in true }
+        effects.menuShortcut = { _, _ in false }
         effects.insert = { _, _, _ in false }
         return effects
+    }
+
+    func testBackgroundPixelClickUsesAXPressWhenAvailable() async {
+        var effects = fakeEffects()
+        var pressedAt: CGPoint?
+        var events: [CGEvent] = []
+        effects.axPressAt = { _, point in pressedAt = point; return true }
+        effects.post = { event, _, _ in events.append(event) }
+        let backend = InputToolsBackend(effects: effects)
+        let result = await backend.invoke(name: "click", arguments: arguments(["x": 40, "y": 60]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(pressedAt, CGPoint(x: 120, y: 230))
+        XCTAssertTrue(events.isEmpty)
+    }
+
+    func testBackgroundDoubleClickRepeatsAXPressSoAppsIgnoringPidEventsStillSeeTwoPresses() async {
+        var effects = fakeEffects()
+        var presses = 0
+        effects.axPressAt = { _, _ in presses += 1; return true }
+        effects.post = { _, _, _ in XCTFail("AX-pressable control must not receive ignored pid events") }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "double_click", arguments: arguments(["x": 40, "y": 60]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(presses, 2)
+    }
+
+    func testBackgroundCommandHotkeyPressesMenuItemBecausePidKeyEventsSkipTheMenuBar() async {
+        var effects = fakeEffects()
+        var chord: ComputerUseNativeMenuChord?
+        effects.menuShortcut = { _, c in chord = c; return true }
+        effects.post = { _, _, _ in XCTFail("menu-backed chord must not fall back to key events") }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "hotkey", arguments: arguments(["keys": ["cmd", "c"]]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(chord?.key, "C")
+        XCTAssertEqual(chord?.command, true)
     }
 
     func testBackgroundPixelDeliveryConvertsScaleTagsEventsAndNeverActivates() async {
@@ -170,6 +207,35 @@ final class InputToolsTests: XCTestCase {
             guard let text = result.content.first?.text else { XCTFail("missing error"); continue }
             XCTAssertTrue(text.hasPrefix("human_activity"), text)
         }
+    }
+
+    func testForegroundSucceedsWhenRaiseFailsIfActivationMakesTargetFrontmost() async {
+        var effects = fakeEffects()
+        var frontmost: Int32 = 99
+        var events: [CGEvent] = []
+        effects.frontmost = { frontmost }
+        effects.activate = { pid in frontmost = pid; return true }
+        effects.raise = { _ in false }
+        effects.post = { event, _, foreground in
+            XCTAssertTrue(foreground)
+            events.append(event)
+        }
+        let backend = InputToolsBackend(effects: effects)
+        let result = await backend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(events.count, 2)
+
+        effects.focusedWindow = { _ in false }
+        let otherWindowBackend = InputToolsBackend(effects: effects)
+        let otherWindow = await otherWindowBackend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
+        XCTAssertTrue(otherWindow.isError, "keys must never reach a sibling window of the same app")
+        XCTAssertEqual(events.count, 2)
+
+        effects.activate = { _ in false }
+        let failingBackend = InputToolsBackend(effects: effects)
+        let failed = await failingBackend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
+        XCTAssertTrue(failed.isError)
+        XCTAssertEqual(events.count, 2)
     }
 
     func testForegroundRestoresPriorAppAndWindowMoveDoesNotWarp() async {

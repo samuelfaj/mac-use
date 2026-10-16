@@ -132,9 +132,17 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         var activity: (ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity = { InputNative.userActivity(target: $0) }
         var frontmost: () -> Int32? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
         var activate: (Int32) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activate(options: []) ?? false }
+        var menuShortcut: (ComputerUseNativeHostTarget, ComputerUseNativeMenuChord) -> Bool = {
+            InputNative.menuShortcut(target: $0, chord: $1) == .applied
+        }
+        var focusedWindow: (ComputerUseNativeHostTarget) -> Bool = { InputNative.focusedTarget(target: $0) }
         var raise: (ComputerUseNativeHostTarget) -> Bool = { target in
             guard let window = InputNative.exactAXWindow(target: target) else { return false }
-            return AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success
+            if AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success { return true }
+            if AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue) == .success { return true }
+            return AXUIElementSetAttributeValue(
+                AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute as CFString, window
+            ) == .success
         }
         var scale: (CGRect) -> Double = { bounds in
             var displays = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -153,6 +161,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             guard let element = InputNative.element(target: target, id: id),
                   InputNative.actionNames(of: element).contains(action) else { return false }
             return AXUIElementPerformAction(element, action as CFString) == .success
+        }
+        var axPressAt: (ComputerUseNativeHostTarget, CGPoint) -> Bool = { target, point in
+            InputNative.leftClick(target: target, coordinate: [point.x, point.y]) == .applied
         }
         var elementPoint: (ComputerUseNativeHostTarget, String) -> CGPoint? = { target, id in
             guard let element = InputNative.element(target: target, id: id),
@@ -332,8 +343,11 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             }
         }
         if temporaryActivation {
-            guard effects.activate(target.pid), effects.raise(target) else { throw InputToolsError("foreground activation or AXRaise failed") }
+            guard effects.activate(target.pid) else { throw InputToolsError("foreground activation failed") }
+            _ = effects.raise(target)
             effects.sleep(0.15)
+            guard effects.frontmost() == target.pid else { throw InputToolsError("foreground activation failed: target app did not become frontmost") }
+            guard effects.focusedWindow(target) else { throw InputToolsError("foreground activation failed: target window did not become focused") }
             try guardActivity()
         }
         func point(_ x: String, _ y: String) throws -> CGPoint {
@@ -391,7 +405,18 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                 guard let center = effects.elementPoint(target, id) else { throw InputToolsError("element bounds unavailable") }
                 location = center
             } else { location = try point("x", "y") }
-            try mouse(location, count: name == "double_click" ? 2 : ((a["count"] as? NSNumber)?.intValue ?? 1), button: a["button"] as? String ?? "left", flags: InputKey.modifiers(a["modifier"] as? [String] ?? []))
+            let count = name == "double_click" ? 2 : ((a["count"] as? NSNumber)?.intValue ?? 1)
+            let button = a["button"] as? String ?? "left"
+            let modifiers = try InputKey.modifiers(a["modifier"] as? [String] ?? [])
+            // Many apps ignore pid-directed mouse events; press the hit-tested AX control instead.
+            if !foreground, !desktop, id == nil, button == "left", modifiers.isEmpty, effects.axPressAt(target, location) {
+                for _ in 1..<count {
+                    effects.sleep(0.04)
+                    guard effects.axPressAt(target, location) else { throw InputToolsError("AX press failed on repeat") }
+                }
+                return ["ok": true, "delivery": "accessibility"]
+            }
+            try mouse(location, count: count, button: button, flags: modifiers)
         case "drag":
             let start = try point("from_x", "from_y"), end = try point("to_x", "to_y")
             let duration = ((a["duration_ms"] as? NSNumber)?.doubleValue ?? 500) / 1000
@@ -422,7 +447,14 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                 if delay > 0 { effects.sleep(delay) }
             }
         case "press_key": try keyboard(InputKey.parse(a["key"] as! String, modifiers: a["modifiers"] as? [String] ?? []))
-        case "hotkey": try keyboard(InputKey.hotkey(a["keys"] as! [String]))
+        case "hotkey":
+            let keys = a["keys"] as! [String]
+            // pid-directed key events skip the menu bar, so background command chords press their menu item.
+            if !foreground, !desktop, let chord = ComputerUseNativeMenuChord.parse(keys.joined(separator: "+")), chord.command,
+               effects.menuShortcut(target, chord) {
+                return ["ok": true, "delivery": "accessibility"]
+            }
+            try keyboard(InputKey.hotkey(keys))
         case "move_cursor":
             let location = try point("x", "y")
             if desktop {
