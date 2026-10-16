@@ -85,6 +85,14 @@ final class NativeMCPTests: XCTestCase {
 
     // After a ScreenCaptureKit timeout the screenshot falls back to Quartz and
     // skips ScreenCaptureKit for a while instead of failing every call slowly.
+    func testElementTraversalReachesNestedElectronControls() {
+        XCTAssertGreaterThanOrEqual(NativeElementID.maximumDepth, 32)
+        XCTAssertEqual(NativeElementID.maximumNodes, 1_000)
+        XCTAssertNotNil(NativeElementID.index("ax_199"))
+        XCTAssertNotNil(NativeElementID.index("ax_999"))
+        XCTAssertNil(NativeElementID.index("ax_1000"))
+    }
+
     func testCaptureTimeoutFallsBackToQuartzAndMarksStall() {
         typealias Platform = ComputerUseNativeHostBackend.NativePlatform
         XCTAssertTrue(Platform.allowsQuartzFallback(domain: Platform.timeoutDomain, code: -1))
@@ -521,7 +529,7 @@ final class NativeMCPTests: XCTestCase {
         XCTAssertTrue(both.content[0].text?.contains("either element_id or role+label") == true)
         let neither = await backend.invoke(name: "set_value", arguments: base.merging(["value": "x"]) { _, new in new })
         XCTAssertTrue(neither.isError)
-        for bad in ["ax_200", "ax_-1", "ax_01", "x_1", "ax_", "ax_1000"] {
+        for bad in ["ax_-1", "ax_01", "x_1", "ax_", "ax_1000"] {
             let result = await backend.invoke(name: "click_element", arguments: base.merging(["element_id": bad]) { _, new in new })
             XCTAssertTrue(result.isError, bad)
             XCTAssertTrue(result.content[0].text?.contains("out of range or malformed") == true, bad)

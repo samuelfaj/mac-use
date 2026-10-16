@@ -39,7 +39,7 @@ final class InputToolsTests: XCTestCase {
             ["x": 0, "y": 0], arguments(["x": 0]), arguments(["x": true, "y": 0]),
             arguments(["x": Double.nan, "y": 0]), arguments(["x": 0, "y": 0, "count": 0]),
             arguments(["x": 0, "y": 0, "count": 1.5]), arguments(["x": 0, "y": 0, "button": "other"]),
-            arguments(["element_id": "ax_1", "x": 0, "y": 0]), arguments(["element_id": "ax_200"]),
+            arguments(["element_id": "ax_1", "x": 0, "y": 0]), arguments(["element_id": "ax_1000"]),
             arguments(["element_id": "ax_1", "action": "delete"]), arguments(["x": 0, "y": 0, "action": "open"]),
             ["scope": "desktop", "element_id": "ax_1"], arguments(["x": 0, "y": 0, "delivery_mode": "automatic"]),
             ["target_pid": 0, "target_window_id": 7, "x": 0, "y": 0],

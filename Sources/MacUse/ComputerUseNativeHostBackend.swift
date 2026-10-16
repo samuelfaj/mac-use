@@ -136,8 +136,8 @@ public struct NativeSettleWatcher: @unchecked Sendable {
 /// `ax_<n>` ids from get_ui_tree: depth-first index under the same node and
 /// depth limits as the serializer. Only valid with that observation's token.
 enum NativeElementID {
-    static let maximumNodes = 200
-    static let maximumDepth = 8
+    static let maximumNodes = 1_000
+    static let maximumDepth = 32
 
     static func index(_ id: String) -> Int? {
         guard id.hasPrefix("ax_") else { return nil }
@@ -2453,14 +2453,14 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult {
             if screenCaptureStalled() {
-                return .unavailable("screen_capture_stalled_retry_later")
+                return encodeQuartz(target: target, region: CaptureZoomContext.region, after: .quartzFallback("screen_capture_stalled_retry_later"))
             }
             let region = CaptureZoomContext.region
             guard let result = await withDeadline(seconds: captureTotalTimeoutSeconds, {
                 await capture(target: target, region: region)
             }) else {
                 markScreenCaptureStalled()
-                return .unavailable("screen_capture_timeout")
+                return encodeQuartz(target: target, region: region, after: .quartzFallback("screen_capture_timeout"))
             }
             return result
         }
