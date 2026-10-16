@@ -63,6 +63,26 @@ final class InputToolsTests: XCTestCase {
         XCTAssertTrue(try AXTextInsertion.insert("hello", read: { polls >= 2 ? "hello" : "" }, selected: { true }, value: { XCTFail("do not retry"); return true }, wait: { polls += 1 }))
     }
 
+    func testAcceptedValueWriteWaitsForDelayedReadbackWithoutWritingAgain() throws {
+        var polls = 0
+        var writes = 0
+        XCTAssertTrue(try AXTextInsertion.insert("hello", read: { polls >= 2 ? "hello" : "" }, selected: { false }, value: { writes += 1; return true }, wait: { polls += 1 }))
+        XCTAssertEqual(writes, 1)
+    }
+
+    func testUnverifiedAcceptedValueWriteNeverFallsBackToUnicode() async {
+        var effects = fakeEffects()
+        var writes = 0
+        effects.insert = { _, _, text in
+            try AXTextInsertion.insert(text, read: { "" }, selected: { false }, value: { writes += 1; return true }, wait: {})
+        }
+        effects.post = { _, _, _ in XCTFail("accepted value write must never be duplicated through Unicode") }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "type_text", arguments: arguments(["element_id": "ax_1", "text": "hello"]))
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("AX value insertion accepted but unverified") == true)
+        XCTAssertEqual(writes, 1)
+    }
+
     func testFailedExplicitAXPressNeverFallsBackToPointer() async {
         var effects = fakeEffects()
         effects.axAction = { _, _, _ in false }

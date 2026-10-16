@@ -19,7 +19,12 @@ enum AXTextInsertion {
             throw InputToolsError("AX text insertion accepted but unverified; no retry was sent")
         }
         guard let before, before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        return value() && read() == text
+        guard value() else { return false }
+        for _ in 0..<15 {
+            if read() == text { return true }
+            wait()
+        }
+        throw InputToolsError("AX value insertion accepted but unverified; no retry was sent")
     }
 }
 
