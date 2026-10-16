@@ -205,7 +205,14 @@ final class NativeMCPTests: XCTestCase {
             "screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "cua_status",
             "left_click", "type", "click_element", "set_value", "menu_shortcut", "restore_window", "right_click", "mouse_move", "scroll", "key",
             "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status", "run_subtask",
-        ]))
+        ]).union(ChromeProfileComputerUseBackend.tools)
+            .union(DesktopToolsBackend.observationTools + DesktopToolsBackend.mutationTools)
+            .union(InputToolsBackend.observationTools + InputToolsBackend.mutationTools)
+            .union(SessionToolsBackend.observationTools + SessionToolsBackend.mutationTools))
+        XCTAssertEqual(tools.count, Set(tools.compactMap { $0["name"] as? String }).count, "tool names must be unique")
+        for tool in tools {
+            XCTAssertNotEqual(tool["description"] as? String, tool["name"] as? String, "every tool needs a real description")
+        }
         for tool in tools {
             XCTAssertNotNil(tool["inputSchema"] as? [String: Any])
         }

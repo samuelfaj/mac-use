@@ -172,7 +172,7 @@ export async function settle(session, limits = settleLimits) {
     const tab = await ownedTab(session);
     let poll;
     try {
-      [{result: poll}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, world: 'MAIN', func: settlePoll});
+      [{result: poll}] = await executePageScript({target: {tabId: tab.id}, world: 'MAIN', func: settlePoll});
     } catch {
       poll = {pending: 1, idle: 0};
     }
@@ -219,6 +219,10 @@ export async function handleRequest(request) {
   if (operation === 'browser_close') {
     const entry = sessions.get(session);
     if (!entry) return {closed: false, released: false};
+    if (debuggerTabs.has(entry.tabId)) {
+      await chrome.debugger.detach({tabId: entry.tabId});
+      debuggerTabs.delete(entry.tabId);
+    }
     let tab;
     try { tab = await chrome.tabs.get(entry.tabId); }
     catch {
@@ -258,6 +262,7 @@ export async function handleRequest(request) {
     }
     return {url, loading: true, next: 'Use browser_snapshot to read the page after navigation.'};
   }
+  if (extendedTools.includes(operation)) return extendedRequest(operation, session, args);
   if (!['browser_snapshot', 'browser_act'].includes(operation)) throw new Error('Unknown browser operation.');
   if (operation === 'browser_act') {
     if (!['click', 'fill', 'type', 'scroll'].includes(args.action)) throw new Error('Unsupported browser action.');
@@ -266,8 +271,8 @@ export async function handleRequest(request) {
   }
   const tab = await ownedTab(session);
   if (tab.status === 'loading') throw new Error('The page is still loading. Take a browser_snapshot again shortly.');
-  validURL(tab.url);
-  const run = (world, func, funcArgs) => chrome.scripting.executeScript({target: {tabId: tab.id}, world, func, args: funcArgs});
+  if (new URL(tab.url).protocol !== 'about:') validURL(tab.url);
+  const run = (world, func, funcArgs) => executePageScript({target: {tabId: tab.id}, world, func, args: funcArgs});
   if (operation === 'browser_act') await run('MAIN', settleBegin);
   let results = await run('ISOLATED', pageOperation, [operation, args]);
   let settled = {};
@@ -282,6 +287,243 @@ export async function handleRequest(request) {
   }
   if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
   return {...results[0].result, ...settled};
+}
+
+async function executePageScript(options) {
+  const tab = await chrome.tabs.get(options.target.tabId);
+  if (new URL(tab.url).protocol !== 'about:') return chrome.scripting.executeScript(options);
+  const source = {tabId: tab.id};
+  const alreadyAttached = debuggerTabs.has(tab.id);
+  if (!alreadyAttached) {
+    await chrome.debugger.attach(source, '1.3');
+    debuggerTabs.set(tab.id, {});
+  }
+  const state = debuggerTabs.get(tab.id);
+  const command = (method, params = {}) => chrome.debugger.sendCommand(source, method, params);
+  try {
+    if (tab.active || [...sessions.values()].some(entry => entry.tabId === tab.id && entry.takenOver)) throw new Error('human_activity: the tab is visible.');
+    await command('Page.enable');
+    const {frameTree} = await command('Page.getFrameTree');
+    let contextId;
+    if (options.world !== 'MAIN') {
+      ({executionContextId: contextId} = await command('Page.createIsolatedWorld', {frameId: frameTree.frame.id, worldName: 'mac-use-about'}));
+      state.contextId = contextId;
+    }
+    const result = await command('Runtime.evaluate', {
+      expression: `(${options.func.toString()})(...${JSON.stringify(options.args || [])})`,
+      ...(contextId ? {contextId} : {}), returnByValue: true
+    });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+    return [{result: result.result?.value}];
+  } finally {
+    if (!alreadyAttached && !state.dialog) {
+      await chrome.debugger.detach(source);
+      debuggerTabs.delete(tab.id);
+    }
+  }
+}
+
+// Debugger attaches only during calls. An open dialog keeps it attached until handled.
+// Dialogs opened while detached are not observable; inspect enables Page for this call.
+const debuggerTabs = new Map();
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const state = debuggerTabs.get(source.tabId);
+  if (!state) return;
+  if (method === 'Page.javascriptDialogOpening') state.dialog = params;
+  if (method === 'Page.javascriptDialogClosed') state.dialog = undefined;
+  if (method === 'Runtime.executionContextCreated') {
+    const context = params.context;
+    if (context.origin === `chrome-extension://${chrome.runtime.id}` || context.name === 'mac-use-about') state.contextId = context.id;
+  }
+});
+chrome.debugger.onDetach.addListener(source => debuggerTabs.delete(source.tabId));
+
+const extendedTools = ['browser_navigate', 'browser_click', 'browser_type', 'browser_pointer',
+  'browser_dialog', 'browser_set_input_files', 'browser_download', 'page'];
+
+// Runs in the same isolated world as snapshot references.
+export function resolveTarget(args) {
+  if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
+  const element = args.ref ? globalThis.__macUseSnapshot?.get(args.ref)?.element
+    : args.css_selector ? document.querySelector(args.css_selector) : undefined;
+  if ((args.ref || args.css_selector) && !element?.isConnected) throw new Error('stale_reference: take a new browser_snapshot.');
+  if (!element) {
+    if (!Number.isFinite(args.x) || !Number.isFinite(args.y) || args.x < 0 || args.y < 0 || args.x >= innerWidth || args.y >= innerHeight) throw new Error('A ref or finite viewport x,y is required.');
+    return {x: args.x, y: args.y};
+  }
+  const entry = args.ref && globalThis.__macUseSnapshot.get(args.ref);
+  const signature = {
+    role: element.getAttribute('role') || element.tagName.toLowerCase(),
+    name: (element.getAttribute('aria-label') || element.labels?.[0]?.innerText || element.innerText || element.getAttribute('name') || '').trim().slice(0, 500),
+    type: element.type || '', disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+    readOnly: Boolean(element.readOnly), href: element.getAttribute('href') || '',
+    value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
+  };
+  if (entry && JSON.stringify(signature) !== JSON.stringify(entry.signature)) throw new Error('stale_reference: take a new browser_snapshot.');
+  if (element.disabled || element.getAttribute('aria-disabled') === 'true') throw new Error('The element is disabled.');
+  element.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) throw new Error('The element is not visible.');
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  const top = document.elementFromPoint(x, y);
+  if (top && top !== element && !element.contains(top) && element.getRootNode()?.host !== top) throw new Error('element is covered');
+  if (args.focus) element.focus({preventScroll: true});
+  return {x, y, href: element.href};
+}
+
+export function pageQuery(args) {
+  if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
+  if (args.action === 'get_text') return (args.css_selector ? document.querySelector(args.css_selector) : document.body)?.innerText || '';
+  return Array.from(document.querySelectorAll(args.css_selector)).slice(0, 200).map(element => ({
+    tag: element.tagName.toLowerCase(), text: element.innerText,
+    attributes: Object.fromEntries((args.attributes || []).map(name => [name, element.getAttribute(name)]))
+  }));
+}
+
+async function extendedRequest(operation, session, args) {
+  let tab = await ownedTab(session);
+  const run = async (func, values, world = 'ISOLATED') => {
+    await ownedTab(session);
+    const result = await executePageScript({target: {tabId: tab.id}, world, func, args: values});
+    if (!result[0] || result[0].error) throw new Error('Page script failed.');
+    await ownedTab(session);
+    return result[0].result;
+  };
+  const snapshot = async extra => ({...await handleRequest({operation: 'browser_snapshot', session}), ...extra});
+  if (operation === 'browser_navigate') {
+    if (typeof args.url !== 'string') throw new Error('url must be a string.');
+    const url = new URL(args.url);
+    if (!['http:', 'https:', 'about:'].includes(url.protocol)) throw new Error('Only HTTP, HTTPS and about URLs are supported.');
+    await run(() => { globalThis.__macUseSnapshot = undefined; }, []);
+    await ownedTab(session);
+    await chrome.tabs.update(tab.id, {url: url.href});
+    await settle(session);
+    return snapshot({});
+  }
+  if (operation === 'page') {
+    if (!['execute_javascript', 'get_text', 'query_dom', 'click_element', 'insert_text', 'type_keystrokes'].includes(args.action)) throw new Error('Unsupported page action.');
+    args = {...args, css_selector: args.css_selector || args.selector};
+    if (args.action === 'get_text' || args.action === 'query_dom') {
+      if (args.action === 'query_dom' && typeof args.css_selector !== 'string') throw new Error('css_selector is required.');
+      if (args.attributes !== undefined && (!Array.isArray(args.attributes) || args.attributes.some(a => typeof a !== 'string'))) throw new Error('attributes must be strings.');
+      return {result: await run(pageQuery, [args])};
+    }
+    if (args.action !== 'execute_javascript') return extendedRequest(args.action === 'click_element' ? 'browser_click' : 'browser_type', session,
+      {...args, mode: args.action === 'type_keystrokes' ? 'keystrokes' : 'insert_text'});
+    if (typeof args.javascript !== 'string') throw new Error('javascript is required.');
+  }
+  if (operation === 'browser_download') {
+    if (typeof args.ref !== 'string' || typeof args.directory !== 'string' || !args.directory.startsWith('/')) throw new Error('ref and absolute directory are required.');
+    const target = await run(resolveTarget, [args]);
+    const url = validURL(target.href);
+    await ownedTab(session);
+    const id = await chrome.downloads.download({url, filename: `mac-use/${crypto.randomUUID()}`, saveAs: false, conflictAction: 'uniquify'});
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      await ownedTab(session);
+      const [item] = await chrome.downloads.search({id});
+      if (item?.state === 'complete') {
+        try { return await snapshot({download_path: item.filename}); }
+        catch (error) { throw new Error(`${error.message}; completed download remains at ${item.filename}`); }
+      }
+      if (item?.state === 'interrupted') throw new Error(`Download interrupted: ${item.error}`);
+      if (Date.now() >= deadline) {
+        await chrome.downloads.cancel(id);
+        throw new Error('Download timed out and was cancelled.');
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  if (operation === 'browser_type' && (typeof args.text !== 'string' || !['insert_text', 'keystrokes'].includes(args.mode ?? 'insert_text'))) throw new Error('text and valid mode are required.');
+  if (operation === 'browser_dialog' && !['inspect', 'accept', 'dismiss'].includes(args.action)) throw new Error('Unsupported dialog action.');
+  if (operation === 'browser_dialog' && args.prompt_text !== undefined && typeof args.prompt_text !== 'string') throw new Error('prompt_text must be a string.');
+  if (operation === 'browser_set_input_files' && (typeof args.ref !== 'string' || !Array.isArray(args.paths) || args.paths.some(p => typeof p !== 'string' || !p.startsWith('/') || p.includes('\0')))) throw new Error('ref and absolute paths are required.');
+  if (operation === 'browser_pointer' && !['hover', 'right_click', 'double_click', 'scroll', 'drag'].includes(args.action)) throw new Error('Unsupported pointer action.');
+  const source = {tabId: tab.id};
+  let state = debuggerTabs.get(tab.id);
+  if (!state) {
+    await chrome.debugger.attach(source, '1.3');
+    state = {};
+    debuggerTabs.set(tab.id, state);
+  }
+  const command = async (method, params = {}) => {
+    await ownedTab(session);
+    const result = await chrome.debugger.sendCommand(source, method, params);
+    await ownedTab(session);
+    return result;
+  };
+  try {
+    await command('Page.enable');
+    await command('Runtime.enable');
+    if (operation === 'browser_dialog') {
+      if (args.action === 'inspect') return {dialog: state.dialog || null};
+      await command('Page.handleJavaScriptDialog', {accept: args.action === 'accept', ...(args.prompt_text === undefined ? {} : {promptText: args.prompt_text})});
+      state.dialog = undefined;
+    } else if (operation === 'browser_set_input_files') {
+      if (!state.contextId) throw new Error('Snapshot execution context unavailable. Take a browser_snapshot first.');
+      const result = await command('Runtime.evaluate', {contextId: state.contextId,
+        expression: `(() => { const element = globalThis.__macUseSnapshot?.get(${JSON.stringify(args.ref)})?.element; return element?.isConnected ? element : null; })()`, returnByValue: false});
+      if (!result.result?.objectId || result.exceptionDetails) throw new Error('stale_reference: take a new browser_snapshot.');
+      const objectId = result.result.objectId;
+      try {
+        const {node} = await command('DOM.describeNode', {objectId});
+        if (node.attributes?.includes('disabled')) throw new Error('The element is disabled.');
+        if (node.nodeName !== 'INPUT' || !node.attributes?.some((value, index, all) => value === 'type' && all[index + 1] === 'file')) throw new Error('Reference is not a file input.');
+        await command('DOM.setFileInputFiles', {backendNodeId: node.backendNodeId, files: args.paths});
+      } finally { await command('Runtime.releaseObject', {objectId}); }
+    } else if (operation === 'page') {
+      const result = await command('Runtime.evaluate', {expression: args.javascript, returnByValue: true, awaitPromise: false});
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'JavaScript failed.');
+      if (state.dialog) return {dialog: state.dialog};
+      await settle(session);
+      return snapshot({result: result.result?.value ?? null});
+    } else {
+      const point = async values => {
+        const point = await run(resolveTarget, [values]);
+        if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y) || point.x < 0 || point.y < 0) throw new Error('A ref or finite viewport x,y is required.');
+        return {x: point.x, y: point.y};
+      };
+      const mouse = (type, position, extra = {}) => command('Input.dispatchMouseEvent', {type, ...position, ...extra});
+      const click = async (position, button, count) => {
+        if (!['left', 'right', 'middle'].includes(button) || ![1, 2, 3].includes(count)) throw new Error('Invalid button or click_count.');
+        for (let n = 1; n <= count; n++) {
+          await mouse('mousePressed', position, {button, clickCount: n});
+          await mouse('mouseReleased', position, {button, clickCount: n});
+        }
+      };
+      if (operation === 'browser_type') {
+        if (args.ref || args.css_selector) await point({...args, focus: true});
+        if ((args.mode ?? 'insert_text') === 'insert_text') await command('Input.insertText', {text: args.text});
+        else for (const key of args.text) {
+          await command('Input.dispatchKeyEvent', {type: 'keyDown', key, text: key});
+          await command('Input.dispatchKeyEvent', {type: 'keyUp', key});
+        }
+      } else {
+        const position = await point(args);
+        if (operation === 'browser_click') await click(position, args.button ?? 'left', args.click_count ?? 1);
+        else if (args.action === 'hover') await mouse('mouseMoved', position);
+        else if (args.action === 'right_click' || args.action === 'double_click') await click(position, args.action === 'right_click' ? 'right' : 'left', args.action === 'double_click' ? 2 : 1);
+        else if (args.action === 'scroll') {
+          const deltaX = args.delta_x ?? 0, deltaY = args.delta_y ?? 600;
+          if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('Scroll distances must be finite.');
+          await mouse('mouseWheel', position, {deltaX, deltaY});
+        } else {
+          const destination = await point({ref: args.to_ref, x: args.to_x, y: args.to_y});
+          await mouse('mousePressed', position, {button: 'left', clickCount: 1});
+          try { await mouse('mouseMoved', destination, {button: 'left', buttons: 1}); }
+          finally { await mouse('mouseReleased', destination, {button: 'left', clickCount: 1}); }
+        }
+      }
+    }
+    if (state.dialog) return {dialog: state.dialog};
+    await settle(session);
+    return snapshot({});
+  } finally {
+    if (!state.dialog) {
+      await chrome.debugger.detach(source);
+      debuggerTabs.delete(tab.id);
+    }
+  }
 }
 
 function badge(text, title) {

@@ -37,4 +37,52 @@ final class ChromeProfileTests: XCTestCase {
             XCTAssertTrue(String(describing: result).contains(expectedError ? "human_activity" : "connected"))
         }
     }
+    func testExtendedBrowserToolsHaveCatalogMetadataAndMutationClassification() throws {
+        let names = ["browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_set_input_files", "browser_download", "page"]
+        for name in names {
+            XCTAssertTrue(ChromeProfileComputerUseBackend.tools.contains(name), name)
+            XCTAssertTrue(ChromeProfileComputerUseBackend.mutationTools.contains(name), name)
+            XCTAssertNotNil(ChromeProfileComputerUseBackend.description(for: name), name)
+            let schema = try XCTUnwrap(ChromeProfileComputerUseBackend.inputSchema(for: name))
+            XCTAssertEqual(schema["type"] as? String, "object")
+            XCTAssertNotNil(schema["properties"] as? [String: Any])
+        }
+        XCTAssertEqual(Set(ChromeProfileComputerUseBackend.tools).count, ChromeProfileComputerUseBackend.tools.count)
+        XCTAssertNil(ChromeProfileComputerUseBackend.inputSchema(for: "unknown"))
+        XCTAssertNil(ChromeProfileComputerUseBackend.description(for: "unknown"))
+    }
+
+    func testDownloadMovesCompletedFileAndRejectsMissingDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-download-\(UUID().uuidString)")
+        let destination = root.appendingPathComponent("destination")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("download.txt")
+        try Data("download".utf8).write(to: source)
+        let backend = ChromeProfileComputerUseBackend(send: { _ in ["ok": true, "download_path": source.path] })
+        let result = await backend.invoke(name: "browser_download", arguments: ["ref": "ref", "directory": destination.path])
+        XCTAssertFalse(result.isError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("download.txt")), "download")
+        let text = try XCTUnwrap(result.content.first?.text)
+        let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        XCTAssertEqual(response["path"] as? String, destination.appendingPathComponent("download.txt").path)
+        let invalid = await backend.invoke(name: "browser_download", arguments: ["ref": "ref", "directory": root.appendingPathComponent("missing").path])
+        XCTAssertTrue(invalid.isError)
+    }
+
+    func testDownloadNeverOverwritesDestination() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-download-\(UUID().uuidString)")
+        let destination = root.appendingPathComponent("destination")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("download.txt")
+        try Data("new".utf8).write(to: source)
+        try Data("old".utf8).write(to: destination.appendingPathComponent("download.txt"))
+        let backend = ChromeProfileComputerUseBackend(send: { _ in ["ok": true, "download_path": source.path] })
+        let result = await backend.invoke(name: "browser_download", arguments: ["ref": "ref", "directory": destination.path])
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(try String(contentsOf: source), "new")
+        XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("download.txt")), "old")
+    }
 }

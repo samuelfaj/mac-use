@@ -3,7 +3,7 @@ import MacUse
 
 @main
 struct MacUseServer {
-    static func main() async {
+    static func main() {
         let args = CommandLine.arguments
         if args.count > 1 {
             do {
@@ -25,10 +25,16 @@ struct MacUseServer {
             return
         }
         let handler = ManagedComputerUseMCP()
-        while let line = readLine() {
-            if let response = await handler.handle(line) {
-                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+        Task.detached {
+            while let line = readLine() {
+                if let response = await handler.handle(line) {
+                    FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                }
             }
+            exit(0)
         }
+        // Keep the main thread available for lazy AppKit overlays.
+        RunLoop.main.add(Port(), forMode: .default)
+        RunLoop.main.run()
     }
 }

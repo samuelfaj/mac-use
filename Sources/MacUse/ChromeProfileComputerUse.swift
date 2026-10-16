@@ -216,7 +216,49 @@ public enum ChromeProfileConnection {
 }
 
 public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unchecked Sendable {
-    public static let tools = ["browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
+    public static let observationTools = ["browser_snapshot", "browser_status"]
+    public static let mutationTools = ["browser_open", "browser_act", "browser_close", "browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_set_input_files", "browser_download", "page"]
+    public static let tools = observationTools + mutationTools
+
+    public static func description(for name: String) -> String? {
+        switch name {
+        case "browser_navigate": return "Navigate the session's owned background tab to an HTTP, HTTPS or about URL. Invalidates previous refs and returns a fresh snapshot."
+        case "browser_click": return "Trusted click on a snapshot ref or viewport x,y in the owned background tab. Returns a fresh snapshot."
+        case "browser_type": return "Type text into the owned background tab, optionally focusing a ref. insert_text inserts text; keystrokes sends key events per character. Returns a fresh snapshot."
+        case "browser_pointer": return "Hover, right-click, double-click, scroll or drag in the owned background tab using refs or viewport coordinates. Returns a fresh snapshot."
+        case "browser_dialog": return "Inspect, accept or dismiss a JavaScript dialog. Debugger stays attached while a dialog is open, otherwise detaches after each call. Only dialogs observed while attached are tracked."
+        case "browser_set_input_files": return "Set absolute local file paths on a file input ref in the owned background tab. Returns a fresh snapshot."
+        case "browser_download": return "Download a link ref through Chrome Downloads, then move the completed file to an existing absolute directory. Returns final path and a fresh snapshot."
+        case "page": return "Execute JavaScript, get text, query DOM attributes, click an element or type text in the owned background tab. Mutations return a fresh snapshot."
+        default: return nil
+        }
+    }
+
+    public static func inputSchema(for name: String) -> [String: Any]? {
+        let string: [String: Any] = ["type": "string"]
+        let number: [String: Any] = ["type": "number"]
+        let point: [String: Any] = ["ref": string, "x": number, "y": number]
+        var properties: [String: Any]
+        var required: [String] = []
+        switch name {
+        case "browser_navigate": properties = ["url": string]; required = ["url"]
+        case "browser_click":
+            properties = point.merging(["button": ["type": "string", "enum": ["left", "right", "middle"]], "click_count": ["type": "integer", "enum": [1, 2, 3]]]) { _, new in new }
+        case "browser_type":
+            properties = ["ref": string, "text": string, "mode": ["type": "string", "enum": ["insert_text", "keystrokes"]]]; required = ["text"]
+        case "browser_pointer":
+            properties = point.merging(["action": ["type": "string", "enum": ["hover", "right_click", "double_click", "scroll", "drag"]], "to_ref": string, "to_x": number, "to_y": number, "delta_x": number, "delta_y": number]) { _, new in new }; required = ["action"]
+        case "browser_dialog":
+            properties = ["action": ["type": "string", "enum": ["inspect", "accept", "dismiss"]], "prompt_text": string]; required = ["action"]
+        case "browser_set_input_files":
+            properties = ["ref": string, "paths": ["type": "array", "items": string]]; required = ["ref", "paths"]
+        case "browser_download": properties = ["ref": string, "directory": string]; required = ["ref", "directory"]
+        case "page":
+            properties = ["action": ["type": "string", "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "insert_text", "type_keystrokes"]], "javascript": string, "css_selector": string, "attributes": ["type": "array", "items": string], "selector": string, "text": string]; required = ["action"]
+        default: return nil
+        }
+        return ["type": "object", "properties": properties, "required": required, "additionalProperties": false]
+    }
     private let sessionID = UUID().uuidString
     private let send: @Sendable ([String: Any]) throws -> [String: Any]
     private let queue = DispatchQueue(label: "io.remotecode.chrome-profile")
@@ -230,7 +272,32 @@ public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unc
             queue.async { [self] in
                 do {
                     guard Self.tools.contains(name) else { throw ChromeProfileConnection.Failure(message: "Unknown browser tool.") }
-                    let response = try send(["operation": name, "session": sessionID, "arguments": arguments])
+                    var downloadDirectory: URL?
+                    if name == "browser_download" {
+                        var isDirectory: ObjCBool = false
+                        guard let path = arguments["directory"] as? String, path.hasPrefix("/"), !path.contains("\0"),
+                              FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                            throw ChromeProfileConnection.Failure(message: "directory must be an existing absolute directory.")
+                        }
+                        downloadDirectory = URL(fileURLWithPath: path, isDirectory: true)
+                    }
+                    var response = try send(["operation": name, "session": sessionID, "arguments": arguments])
+                    if let directory = downloadDirectory, response["ok"] as? Bool == true {
+                        guard let path = response["download_path"] as? String, path.hasPrefix("/"), !path.contains("\0") else {
+                            throw ChromeProfileConnection.Failure(message: "Chrome did not return an absolute completed download path.")
+                        }
+                        let source = URL(fileURLWithPath: path)
+                        let destination = directory.appendingPathComponent(source.lastPathComponent)
+                        do {
+                            if source.standardizedFileURL != destination.standardizedFileURL {
+                                try FileManager.default.moveItem(at: source, to: destination)
+                            }
+                        } catch {
+                            throw ChromeProfileConnection.Failure(message: "Download remains at \(path); move failed: \(error.localizedDescription)")
+                        }
+                        response["path"] = destination.path
+                        response.removeValue(forKey: "download_path")
+                    }
                     let data = try JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])
                     continuation.resume(returning: ComputerUseToolResult(
                         text: String(decoding: data, as: UTF8.self), isError: response["ok"] as? Bool != true

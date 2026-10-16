@@ -2918,7 +2918,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return found
         }
 
-        private static func element(target: ComputerUseNativeHostTarget, id: String) -> AXUIElement? {
+        static func element(target: ComputerUseNativeHostTarget, id: String) -> AXUIElement? {
             guard AXIsProcessTrusted(),
                   let index = NativeElementID.index(id),
                   let window = exactAXWindow(target: target) else { return nil }
@@ -2984,18 +2984,18 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return CFEqual(match, focused)
         }
 
-        private static func actionNames(of element: AXUIElement) -> [String] {
+        static func actionNames(of element: AXUIElement) -> [String] {
             var names: CFArray?
             guard AXUIElementCopyActionNames(element, &names) == .success,
                   let actions = names as? [String] else { return [] }
             return actions
         }
 
-        private static func title(of element: AXUIElement) -> String? {
+        static func title(of element: AXUIElement) -> String? {
             (attribute(kAXTitleAttribute as CFString, from: element) as? String)
         }
 
-        private static func children(of element: AXUIElement) -> [AXUIElement] {
+        static func children(of element: AXUIElement) -> [AXUIElement] {
             attribute(kAXChildrenAttribute as CFString, from: element).flatMap(axElements(from:)) ?? []
         }
 
@@ -3276,7 +3276,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return true
         }
 
-        private static func attribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
+        static func attribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
             return value
@@ -3294,7 +3294,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return Unmanaged<AXValue>.fromOpaque(pointer).takeUnretainedValue()
         }
 
-        private static func exactAXWindow(target: ComputerUseNativeHostTarget) -> AXUIElement? {
+        static func exactAXWindow(target: ComputerUseNativeHostTarget) -> AXUIElement? {
             let quartzWindows = listWindows(bundleID: nil)
             guard let targetQuartzWindow = quartzWindows.first(where: { $0.target == target }) else {
                 return nil
@@ -3348,7 +3348,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return elements
         }
 
-        private static func axElement(from value: CFTypeRef) -> AXUIElement? {
+        static func axElement(from value: CFTypeRef) -> AXUIElement? {
             guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
             let pointer = Unmanaged.passUnretained(value).toOpaque()
             return Unmanaged<AXUIElement>.fromOpaque(pointer).takeUnretainedValue()

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 public struct ComputerUseContentPart: Sendable, Equatable {
@@ -127,8 +128,16 @@ public struct ManagedComputerUseMCP: Sendable {
         "key",
     ]
 
+    /// cua-driver parity tools served by separate backends.
+    static let desktopTools = DesktopToolsBackend.observationTools + DesktopToolsBackend.mutationTools
+    static let inputTools = InputToolsBackend.observationTools + InputToolsBackend.mutationTools
+    static let sessionTools = SessionToolsBackend.observationTools + SessionToolsBackend.mutationTools
+    static let recordedTools = Set(mutationTools + DesktopToolsBackend.mutationTools + InputToolsBackend.mutationTools
+        + ChromeProfileComputerUseBackend.mutationTools)
+
     public static var advertisedToolNames: [String] {
         observationTools + mutationTools + ChromeProfileComputerUseBackend.tools
+            + desktopTools + inputTools + sessionTools
     }
 
     private let queue: ComputerUseHostQueue
@@ -138,6 +147,9 @@ public struct ManagedComputerUseMCP: Sendable {
     private let jevAvailable: @Sendable () -> Bool
     private let cua: CuaSpaces
     private let jevTransport: any JevTransport
+    private let desktop: any ComputerUseToolBackend
+    private let input: any ComputerUseToolBackend
+    private let sessions: SessionToolsBackend
 
     public init(
         queue: ComputerUseHostQueue = .shared,
@@ -148,7 +160,10 @@ public struct ManagedComputerUseMCP: Sendable {
             TypeSafeJevTransport.isConfigured()
         },
         cua: CuaSpaces = CuaSpaces(),
-        jevTransport: any JevTransport = TypeSafeJevTransport()
+        jevTransport: any JevTransport = TypeSafeJevTransport(),
+        desktop: any ComputerUseToolBackend = DesktopToolsBackend(),
+        input: any ComputerUseToolBackend = InputToolsBackend(),
+        sessions: SessionToolsBackend = .shared
     ) {
         self.queue = queue
         self.backend = backend
@@ -157,6 +172,48 @@ public struct ManagedComputerUseMCP: Sendable {
         self.jevAvailable = jevAvailable
         self.cua = cua
         self.jevTransport = jevTransport
+        self.desktop = desktop
+        self.input = input
+        self.sessions = sessions
+        let replay = self
+        sessions.replayDispatcher = { name, arguments in
+            await replay.replayCall(name: name, arguments: arguments)
+        }
+    }
+
+    /// Re-enters tools/call so replayed turns take the same queue, guards and recording.
+    private func replayCall(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
+        let request: [String: Any] = ["jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": ["name": name, "arguments": arguments]]
+        guard let line = encode(request), let response = await handle(line),
+              let data = response.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ComputerUseToolResult(text: "replay call failed", isError: true)
+        }
+        return ComputerUseToolResult.parseUpstream(object)
+    }
+
+    /// Overlay position in screen points for pixel-addressed calls.
+    private static func actionPoint(_ arguments: [String: Any], pid: Int32?, windowID: UInt32?) -> CGPoint? {
+        let pair = (arguments["coordinate"] as? [NSNumber]).flatMap { $0.count == 2 ? ($0[0].doubleValue, $0[1].doubleValue) : nil }
+            ?? ((arguments["x"] as? NSNumber).flatMap { x in (arguments["y"] as? NSNumber).map { (x.doubleValue, $0.doubleValue) } })
+        guard let (x, y) = pair else { return nil }
+        if arguments["scope"] as? String == "desktop" { return CGPoint(x: x, y: y) }
+        guard let pid, let windowID,
+              let window = ComputerUseNativeHostBackend.NativePlatform.listWindows(bundleID: nil)
+                .first(where: { $0.target == ComputerUseNativeHostTarget(pid: pid, windowID: windowID) }) else { return nil }
+        let scale = NSScreen.screens.first { $0.frame.intersects(window.bounds) }?.backingScaleFactor ?? 2
+        return CGPoint(x: window.bounds.minX + x / scale, y: window.bounds.minY + y / scale)
+    }
+
+    private func recorded(_ name: String, _ arguments: [String: Any],
+                          _ perform: () async -> ComputerUseToolResult) async -> ComputerUseToolResult {
+        guard Self.recordedTools.contains(name) else { return await perform() }
+        let pid = Self.targetPID(from: arguments) ?? ComputerUseNativeHostBackend.exactInt32(arguments["pid"])
+        let window = ComputerUseNativeHostBackend.exactUInt32(arguments["target_window_id"])
+            ?? ComputerUseNativeHostBackend.exactUInt32(arguments["window_id"])
+        return await sessions.aroundAction(tool: name, arguments: arguments, targetPID: pid, windowID: window,
+                                           point: Self.actionPoint(arguments, pid: pid, windowID: window), perform: perform)
     }
 
     public func handle(_ line: String) async -> String? {
@@ -177,7 +234,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. List windows, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized; set_value sets a field/slider/checkbox/pop-up by role and label, and menu_shortcut presses the enabled menu item bound to a chord (MOD+S), both without focusing the window. Minimized windows and hidden apps allow get_ui_tree, click_element and set_value; input-event tools need restore_window first. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information. For a multi-step goal with a Jev key, run_subtask runs a bounded observe-decide-act loop over your inputs, verification and constraints and returns SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; secret_inputs are typed but never shown to Jev or returned.",
+                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. Prefer jev_decide / run_subtask / verify_state criteria (Jev, text-only, cheap) before screenshots; screenshots only when Jev returns NEEDS_AGENT/BLOCKED or the surface has no AX/DOM labels. List windows for native work, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized; set_value sets a field/slider/checkbox/pop-up by role and label, and menu_shortcut presses the enabled menu item bound to a chord (MOD+S), both without focusing the window. Minimized windows and hidden apps allow get_ui_tree, click_element and set_value; input-event tools need restore_window first. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information. For a multi-step goal with a Jev key, run_subtask runs a bounded observe-decide-act loop over your inputs, verification and constraints and returns SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; secret_inputs are typed but never shown to Jev or returned.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -188,8 +245,28 @@ public struct ManagedComputerUseMCP: Sendable {
             guard Self.advertisedToolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
             }
+            if Self.sessionTools.contains(name) {
+                let result = await sessions.invoke(name: name, arguments: arguments)
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
+            }
+            if Self.desktopTools.contains(name) || Self.inputTools.contains(name) {
+                let tool = Self.desktopTools.contains(name) ? desktop : input
+                let pid = Self.targetPID(from: arguments) ?? ComputerUseNativeHostBackend.exactInt32(arguments["pid"])
+                do {
+                    // `session` drives the overlay and recording only; backends validate their own keys.
+                    let toolArguments = arguments.filter { $0.key != "session" }
+                    let result = try await queue.withExclusive(kind: Self.recordedTools.contains(name) ? .mutation : .observation, targetPID: pid) {
+                        await recorded(name, arguments) { await tool.invoke(name: name, arguments: toolArguments) }
+                    }
+                    return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
+                } catch is CancellationError {
+                    return errorReply(id: id, code: -32800, message: "computer-use call cancelled")
+                } catch {
+                    return errorReply(id: id, code: -32000, message: String(describing: error))
+                }
+            }
             if ChromeProfileComputerUseBackend.tools.contains(name) {
-                let result = await browser.invoke(name: name, arguments: arguments)
+                let result = await recorded(name, arguments) { await browser.invoke(name: name, arguments: arguments.filter { $0.key != "session" }) }
                 return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
             }
             if name == "cua_status" {
@@ -227,6 +304,11 @@ public struct ManagedComputerUseMCP: Sendable {
                 guard let goal = arguments["goal"] as? String, !goal.isEmpty else {
                     return errorReply(id: id, code: -32602, message: "goal is required")
                 }
+                if let raw = arguments["browser"],
+                   !((raw as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false) {
+                    return errorReply(id: id, code: -32602, message: "browser must be boolean")
+                }
+                let browserMode = arguments["browser"] as? Bool == true
                 var allowedRisks = Set<RiskCategory>()
                 var minConfidence = 0.0
                 var minMargin = 0.0
@@ -256,13 +338,28 @@ public struct ManagedComputerUseMCP: Sendable {
                 }
                 do {
                     let observation = try await queue.withExclusive(kind: .observation, targetPID: targetPID) {
-                        await backend.invoke(name: "get_ui_tree", arguments: arguments.merging(["ocr": "never"]) { _, new in new })
+                        if browserMode { return await browser.invoke(name: "browser_snapshot", arguments: [:]) }
+                        return await backend.invoke(name: "get_ui_tree", arguments: arguments.merging(["ocr": "never"]) { _, new in new })
                     }
                     guard !observation.isError, let text = observation.content.first?.text else {
                         return reply(id: id, result: ["content": observation.jsonContent(), "isError": true])
                     }
                     let outputFromModel: [String: Any]
-                    if jevAvailable() {
+                    if browserMode {
+                        guard let data = text.data(using: .utf8),
+                              let snapshot = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            throw JevDecisionError.invalidObservation
+                        }
+                        var proposal: [String: Any]
+                        if jevAvailable() {
+                            proposal = try await jev.adviseBrowser(goal: goal, snapshot: snapshot, allowedRisks: allowedRisks,
+                                                                 minConfidence: minConfidence, minMargin: minMargin).jsonObject()
+                        } else {
+                            proposal = try jev.localBrowserFallback(snapshot: snapshot, allowedRisks: allowedRisks)
+                        }
+                        proposal["state_token"] = snapshot["state_token"]
+                        outputFromModel = proposal
+                    } else if jevAvailable() {
                         outputFromModel = try await jev.advise(
                             goal: goal, observation: text, allowedRisks: allowedRisks,
                             minConfidence: minConfidence, minMargin: minMargin).jsonObject()
@@ -285,7 +382,7 @@ public struct ManagedComputerUseMCP: Sendable {
             }
             do {
                 let result = try await queue.withExclusive(kind: kind, targetPID: targetPID) {
-                    await backend.invoke(name: name, arguments: arguments)
+                    await recorded(name, arguments) { await backend.invoke(name: name, arguments: arguments) }
                 }
                 return reply(id: id, result: [
                     "content": result.jsonContent(),
@@ -303,10 +400,15 @@ public struct ManagedComputerUseMCP: Sendable {
 
     public static func toolCatalog() -> [[String: Any]] {
         advertisedToolNames.map { name in
-            [
+            var schema = inputSchema(for: name)
+            if recordedTools.contains(name), var properties = schema["properties"] as? [String: Any], properties["session"] == nil {
+                properties["session"] = ["type": "string", "description": "Session id from start_session; shows its agent cursor and records the turn."]
+                schema["properties"] = properties
+            }
+            return [
                 "name": name,
                 "description": description(for: name),
-                "inputSchema": inputSchema(for: name),
+                "inputSchema": schema,
             ]
         }
     }
@@ -336,7 +438,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "get_ui_tree":
             return "Accessibility tree for a window; each actionable element has an ax_<n> id for click_element and set_value. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line of recognized text after the tree. Contains private screen text; use jev_decide for redacted Jev guidance."
         case "jev_decide":
-            return "With a Jev key, ask Jev for one semantic action, WAIT, DONE or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
+            return "Prefer this text-only, cheap Jev step before screenshots. browser:true observes the owned Chrome tab without target_pid/window and proposes browser_act click only, with ref and state_token; never fill. Native mode needs target_pid and target_window_id. With a Jev key, ask Jev for one semantic action, WAIT, DONE, NEEDS_AGENT or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "run_subtask":
             return "Requires a Jev key. Run a bounded loop (max_actions) that observes the window, asks Jev for one semantic step (CLICK, SET_VALUE, HOTKEY, WAIT, DONE, BLOCKED or NEEDS_INPUT), executes it natively and reobserves. Literal text comes only from inputs; secret_inputs are typed but never sent to Jev or returned. Risky controls (delete, send, purchase, close) are withheld unless in allowed_risks. Stops with SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; stops on human activity."
         case "click_element":
@@ -362,7 +464,8 @@ public struct ManagedComputerUseMCP: Sendable {
         case "cua_status":
             return "Read-only: report whether the cua CLI is installed and which cua Spaces are registered. When available, prefer a Space via the cua MCP server for tasks that do not need the user's real apps or sessions."
         default:
-            return name
+            return DesktopToolsBackend.description(for: name) ?? InputToolsBackend.description(for: name)
+                ?? SessionToolsBackend.description(for: name) ?? ChromeProfileComputerUseBackend.description(for: name) ?? name
         }
     }
 
@@ -373,6 +476,10 @@ public struct ManagedComputerUseMCP: Sendable {
             "target_window_id": ["type": "integer"],
             "expected_state_token": ["type": "string"],
         ]
+        if let schema = DesktopToolsBackend.inputSchema(for: name) ?? InputToolsBackend.inputSchema(for: name)
+            ?? SessionToolsBackend.inputSchema(for: name) ?? ChromeProfileComputerUseBackend.inputSchema(for: name) {
+            return schema
+        }
         switch name {
         case "browser_open":
             return ["type": "object", "properties": ["url": ["type": "string"]], "required": ["url"]]
@@ -485,12 +592,14 @@ public struct ManagedComputerUseMCP: Sendable {
             return [
                 "type": "object",
                 "properties": targeting.merging([
+                    "browser": ["type": "boolean", "default": false, "description": "Use the owned Chrome tab DOM snapshot; native target not needed. Proposals click only."],
                     "goal": ["type": "string", "description": "Original user goal; sanitized before sending to Jev."],
                     "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]], "description": "Risk categories of controls the goal explicitly authorizes; other risky controls are withheld."],
                     "min_confidence": ["type": "number", "description": "0-1; below this Jev's answer returns NEEDS_AGENT."],
                     "min_margin": ["type": "number", "description": "0-1; minimum lead over the runner-up choice."],
                 ]) { _, new in new },
-                "required": ["target_pid", "target_window_id", "goal"],
+                "required": ["goal"],
+                "anyOf": [["properties": ["browser": ["const": true]], "required": ["browser"]], ["required": ["target_pid", "target_window_id"]]],
             ]
         case "run_subtask":
             return [
