@@ -3,6 +3,17 @@ import XCTest
 @testable import MacUse
 
 final class DesktopToolsTests: XCTestCase {
+    func testDesktopCaptureTimeoutReleasesCallerWhenCaptureStalls() async {
+        let started = Date()
+        let result = await DesktopToolsBackend.boundedDesktopCapture(seconds: 0.01) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return ComputerUseToolResult(text: "late image")
+        }
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("desktop_capture_timeout") == true)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
+    }
+
     func testEveryToolHasDescriptionAndObjectSchema() throws {
         let tools = DesktopToolsBackend.observationTools + DesktopToolsBackend.mutationTools
         XCTAssertEqual(Set(tools).count, 14)

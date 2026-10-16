@@ -2,9 +2,48 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import Darwin
 
 private typealias InputNative = ComputerUseNativeHostBackend.NativePlatform
 private typealias InputTarget = ComputerUseNativeHostTarget
+
+enum AXTextInsertion {
+    static func insert(_ text: String, read: () -> String?, selected: () -> Bool, value: () -> Bool,
+                       wait: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }) throws -> Bool {
+        let before = read()
+        if selected() {
+            for _ in 0..<15 {
+                if let after = read(), after != before, after.contains(text) { return true }
+                wait()
+            }
+            throw InputToolsError("AX text insertion accepted but unverified; no retry was sent")
+        }
+        guard let before, before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return value() && read() == text
+    }
+}
+
+enum BackgroundEventDelivery {
+    private typealias SetLocation = @convention(c) (CGEvent, CGPoint) -> Void
+    private typealias Post = @convention(c) (Int32, CGEvent) -> Void
+    private static let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
+    private static let postFunction: Post? = {
+        guard let handle, let symbol = dlsym(handle, "SLEventPostToPid") else { return nil }
+        return unsafeBitCast(symbol, to: Post.self)
+    }()
+    private static let locationFunction: SetLocation? = {
+        guard let handle, let symbol = dlsym(handle, "CGEventSetWindowLocation") else { return nil }
+        return unsafeBitCast(symbol, to: SetLocation.self)
+    }()
+    static func deliver(_ event: CGEvent, pid: Int32, native: ((Int32, CGEvent) -> Void)?, fallback: (CGEvent, Int32) -> Void) {
+        if let native { native(pid, event) }
+        else { fallback(event, pid) }
+    }
+    static func setWindowLocation(_ event: CGEvent, point: CGPoint) { locationFunction?(event, point) }
+    static func post(_ event: CGEvent, pid: Int32) {
+        deliver(event, pid: pid, native: postFunction.map { function in { function($0, $1) } }, fallback: { $0.postToPid($1) })
+    }
+}
 
 struct InputToolsError: Error, CustomStringConvertible {
     let description: String
@@ -152,8 +191,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             return Double(mode.pixelWidth) / Double(mode.width)
         }
         var post: (CGEvent, Int32, Bool) -> Void = { event, pid, foreground in
-            if foreground { event.post(tap: .cghidEventTap) } else { event.postToPid(pid) }
+            if foreground { event.post(tap: .cghidEventTap) } else { BackgroundEventDelivery.post(event, pid: pid) }
         }
+        var windowLocation: (CGEvent, CGPoint) -> Void = { BackgroundEventDelivery.setWindowLocation($0, point: $1) }
         var sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }
         var cursor: () -> CGPoint? = { CGEvent(source: nil)?.location }
         var warp: (CGPoint) -> Bool = { CGWarpMouseCursorPosition($0) == .success }
@@ -176,7 +216,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                   AXValueGetValue(size as! AXValue, .cgSize, &dimensions) else { return nil }
             return CGPoint(x: point.x + dimensions.width / 2, y: point.y + dimensions.height / 2)
         }
-        var insert: (ComputerUseNativeHostTarget, String?, String) -> Bool = { target, id, text in
+        var insert: (ComputerUseNativeHostTarget, String?, String) throws -> Bool = { target, id, text in
             let element: AXUIElement?
             if let id { element = InputNative.element(target: target, id: id) }
             else if let window = InputNative.exactAXWindow(target: target),
@@ -185,7 +225,10 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                 element = focused
             } else { element = nil }
             guard let element else { return false }
-            return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+            return try AXTextInsertion.insert(text,
+                read: { InputNative.attribute(kAXValueAttribute as CFString, from: element) as? String },
+                selected: { AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success },
+                value: { AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFString) == .success })
         }
         var focusElement: (ComputerUseNativeHostTarget, String) -> Bool = { target, id in
             guard let element = InputNative.element(target: target, id: id) else { return false }
@@ -213,7 +256,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
 
     public static func description(for name: String) -> String? {
         switch name {
-        case "click": return "Click an AX element or window-local screenshot pixel. Background uses AX or pid-directed events without activation; foreground temporarily activates and restores prior app. Desktop scope uses screen points."
+        case "click": return "Click an AX element or window-local screenshot pixel. Use action:pointer with element_id for explicit pointer delivery when AX reports success without a UI change. Background uses AX or pid-directed events without activation; foreground temporarily activates and restores prior app. Desktop scope uses screen points."
         case "double_click": return "Open an AX element with AXOpen when available, otherwise double-click its center or supplied window-local screenshot pixels."
         case "drag": return "Drag between window-local screenshot pixels with timed mouse events; background by default."
         case "type_text": return "Insert selected text through AX, falling back to Unicode keyboard events. Desktop scope types into frontmost app."
@@ -249,7 +292,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                               "button": ["type": "string", "enum": ["left", "right", "middle"]],
                               "count": ["type": "integer", "minimum": 1, "maximum": 10],
                               "modifier": modifiers,
-                              "action": ["type": "string", "enum": ["press", "show_menu", "confirm", "cancel", "open"]]]) { _, new in new }
+                              "action": ["type": "string", "enum": ["press", "show_menu", "confirm", "cancel", "open", "pointer"]]]) { _, new in new }
         case "drag":
             for key in ["from_x", "from_y", "to_x", "to_y"] { properties[key] = number; required.append(key) }
             properties["duration_ms"] = ["type": "number", "minimum": 0, "maximum": 60000, "default": 500]
@@ -367,6 +410,13 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             if foreground, effects.frontmost() != target.pid { throw InputToolsError("foreground application changed during delivery") }
             guard let event else { throw InputToolsError("CGEvent creation failed") }
             event.setIntegerValueField(.eventSourceUserData, value: ComputerUseNativeActivityMonitor.syntheticEventUserData)
+            if !foreground && !desktop {
+                event.setIntegerValueField(CGEventField(rawValue: 40)!, value: Int64(target.pid))
+                if [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged].contains(event.type) {
+                    if let window { effects.windowLocation(event, CGPoint(x: event.location.x - window.bounds.minX, y: event.location.y - window.bounds.minY)) }
+                    for field: UInt32 in [51, 91, 92] { event.setIntegerValueField(CGEventField(rawValue: field)!, value: Int64(target.windowID)) }
+                }
+            }
             effects.post(event, target.pid, foreground)
         }
         func keyboard(_ key: InputKey) throws {
@@ -380,11 +430,20 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             let cgButton: CGMouseButton = button == "right" ? .right : (button == "middle" ? .center : .left)
             let down: CGEventType = button == "right" ? .rightMouseDown : (button == "middle" ? .otherMouseDown : .leftMouseDown)
             let up: CGEventType = button == "right" ? .rightMouseUp : (button == "middle" ? .otherMouseUp : .leftMouseUp)
+            if !foreground && !desktop {
+                let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: location, mouseButton: cgButton)
+                moved?.flags = flags
+                try post(moved)
+                effects.sleep(0.012)
+            }
+            let gesture = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fffffff)
             for index in 1...count {
                 for type in [down, up] {
                     let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: cgButton)
                     event?.flags = flags
                     event?.setIntegerValueField(.mouseEventClickState, value: Int64(index))
+                    event?.setIntegerValueField(CGEventField(rawValue: 58)!, value: gesture)
+                    event?.setIntegerValueField(CGEventField(rawValue: 7)!, value: 0)
                     try post(event)
                 }
                 if index < count { effects.sleep(0.04) }
@@ -393,12 +452,12 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         switch name {
         case "click", "double_click":
             let id = a["element_id"] as? String
-            let actions = ["press": "AXPress", "show_menu": "AXShowMenu", "confirm": "AXConfirm", "cancel": "AXCancel", "open": "AXOpen"]
+            let actions = ["press": "AXPress", "show_menu": "AXShowMenu", "confirm": "AXConfirm", "cancel": "AXCancel", "open": "AXOpen", "pointer": ""]
             if let id {
                 try guardActivity()
                 let action = name == "double_click" ? "AXOpen" : actions[a["action"] as? String ?? "press"]!
-                if effects.axAction(target, id, action) { return ["ok": true, "delivery": "accessibility"] }
-                if name != "double_click" { throw InputToolsError("AX action unavailable or failed: \(action)") }
+                if !action.isEmpty && effects.axAction(target, id, action) { return ["ok": true, "delivery": "accessibility"] }
+                if !action.isEmpty && name != "double_click" { throw InputToolsError("AX action unavailable or failed: \(action)") }
             }
             let location: CGPoint
             if let id {
@@ -431,7 +490,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         case "type_text":
             let text = a["text"] as! String
             try guardActivity()
-            if !desktop && effects.insert(target, a["element_id"] as? String, text) { return ["ok": true, "delivery": "accessibility"] }
+            if try !desktop && (effects.insert(target, a["element_id"] as? String, text)) { return ["ok": true, "delivery": "accessibility"] }
             if let id = a["element_id"] as? String {
                 try guardActivity()
                 guard effects.focusElement(target, id) else { throw InputToolsError("element unavailable or cannot receive keyboard fallback") }
@@ -506,7 +565,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             if a["element_id"] == nil { try number("x", required: true); try number("y", required: true) }
             else if a["x"] != nil || a["y"] != nil { throw InputToolsError("element_id and pixels are mutually exclusive") }
             if let button = a["button"] as? String, !["left", "right", "middle"].contains(button) { throw InputToolsError("invalid button") }
-            if let action = a["action"] as? String, !["press", "show_menu", "confirm", "cancel", "open"].contains(action) { throw InputToolsError("invalid action") }
+            if let action = a["action"] as? String, !["press", "show_menu", "confirm", "cancel", "open", "pointer"].contains(action) { throw InputToolsError("invalid action") }
             if a["action"] != nil && a["element_id"] == nil { throw InputToolsError("action requires element_id") }
             try number("count", integer: true, min: 1, max: 10)
         case "drag":

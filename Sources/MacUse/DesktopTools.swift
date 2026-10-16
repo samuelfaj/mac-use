@@ -170,7 +170,11 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
                     guard let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == CGMainDisplayID() }) else { return ["error": "main_display_unavailable"] }
                     return ["width": screen.frame.width, "height": screen.frame.height, "backingScaleFactor": screen.backingScaleFactor]
                 })
-            case "get_desktop_state": return try await desktopScreenshot()
+            case "get_desktop_state":
+                return await Self.boundedDesktopCapture {
+                    do { return try await self.desktopScreenshot() }
+                    catch { return Self.result(["error": error.localizedDescription], error: true) }
+                }
             case "launch_app": return try await launch(arguments)
             case "kill_app", "bring_to_front", "set_window_frame":
                 return try await MainActor.run { try Self.mutate(name: name, arguments: arguments) }
@@ -342,6 +346,11 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
             throw Failure(message: "Clipboard write failed; previous clipboard restored: \(restored)")
         }
         return result(["written": true, "types": pasteboard.types?.map(\.rawValue) ?? []])
+    }
+
+    static func boundedDesktopCapture(seconds: Double = 8, operation: @escaping @Sendable () async -> ComputerUseToolResult) async -> ComputerUseToolResult {
+        await ComputerUseNativeHostBackend.NativePlatform.withDeadline(seconds: seconds, operation)
+            ?? Self.result(["error": "desktop_capture_timeout"], error: true)
     }
 
     private func desktopScreenshot() async throws -> ComputerUseToolResult {

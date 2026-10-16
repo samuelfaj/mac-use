@@ -6,6 +6,71 @@ import XCTest
 final class InputToolsTests: XCTestCase {
     private let target = ComputerUseNativeHostTarget(pid: 42, windowID: 7)
     private var base: [String: Any] { ["target_pid": 42, "target_window_id": 7] }
+    func testElementWithoutPressUsesItsExactBoundsForTargetedPointerDelivery() async {
+        var effects = fakeEffects()
+        effects.axAction = { _, _, _ in false }
+        effects.elementPoint = { target, id in
+            XCTAssertEqual(target.windowID, 7); XCTAssertEqual(id, "ax_1")
+            return CGPoint(x: 150, y: 250)
+        }
+        var events: [CGEvent] = []
+        effects.post = { event, _, foreground in XCTAssertFalse(foreground); events.append(event) }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1", "action": "pointer"]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertTrue(events.allSatisfy { $0.location == CGPoint(x: 150, y: 250) })
+        XCTAssertTrue(events.allSatisfy { $0.getIntegerValueField(CGEventField(rawValue: 51)!) == 7 })
+    }
+
+    func testExplicitPointerActionDoesNotPressAXBeforeSendingClick() async {
+        var effects = fakeEffects()
+        effects.axAction = { _, _, _ in XCTFail("explicit pointer must not also AXPress"); return true }
+        effects.elementPoint = { _, _ in CGPoint(x: 150, y: 250) }
+        var events: [CGEvent] = []
+        effects.post = { event, _, _ in events.append(event) }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1", "action": "pointer"]))
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+    }
+
+    func testBackgroundTransportChoosesExactlyOnePidRoute() throws {
+        let event = try XCTUnwrap(CGEvent(source: nil))
+        var native = 0
+        var fallback = 0
+        BackgroundEventDelivery.deliver(event, pid: 42, native: { pid, value in
+            XCTAssertEqual(pid, 42); XCTAssertTrue(value === event); native += 1
+        }, fallback: { _, _ in fallback += 1 })
+        XCTAssertEqual(native, 1); XCTAssertEqual(fallback, 0)
+        BackgroundEventDelivery.deliver(event, pid: 42, native: nil, fallback: { value, pid in
+            XCTAssertEqual(pid, 42); XCTAssertTrue(value === event); fallback += 1
+        })
+        XCTAssertEqual(native, 1); XCTAssertEqual(fallback, 1)
+    }
+
+    func testInsertionVerifiesValueAndUsesValueOnlyForEmptyComposer() throws {
+        var text = "\n"
+        var writes = 0
+        XCTAssertTrue(try AXTextInsertion.insert("hello", read: { text }, selected: { false }, value: { text = "hello"; writes += 1; return true }))
+        XCTAssertEqual(writes, 1)
+        text = "existing draft"
+        XCTAssertFalse(try AXTextInsertion.insert("hello", read: { text }, selected: { false }, value: { XCTFail("must preserve draft"); return true }))
+        XCTAssertTrue(try AXTextInsertion.insert("hello", read: { text }, selected: { text += "hello"; return true }, value: { XCTFail("do not write twice"); return false }))
+    }
+
+    func testAcceptedButUnverifiedInsertionNeverRetriesAndAllowsDelayedReadback() throws {
+        XCTAssertThrowsError(try AXTextInsertion.insert("hello", read: { nil }, selected: { true }, value: { XCTFail("do not retry"); return true }, wait: {}))
+        var polls = 0
+        XCTAssertTrue(try AXTextInsertion.insert("hello", read: { polls >= 2 ? "hello" : "" }, selected: { true }, value: { XCTFail("do not retry"); return true }, wait: { polls += 1 }))
+    }
+
+    func testFailedExplicitAXPressNeverFallsBackToPointer() async {
+        var effects = fakeEffects()
+        effects.axAction = { _, _, _ in false }
+        effects.post = { _, _, _ in XCTFail("ambiguous AX failure must not send another action") }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1", "action": "press"]))
+        XCTAssertTrue(result.isError)
+    }
+
     private func arguments(_ extra: [String: Any]) -> [String: Any] { base.merging(extra) { _, new in new } }
 
     func testKeyTableCoversLettersDigitsNavigationFunctionAndPunctuation() throws {
@@ -169,19 +234,24 @@ final class InputToolsTests: XCTestCase {
             XCTAssertFalse(foreground)
             events.append(event)
         }
+        effects.windowLocation = { _, point in XCTAssertEqual(point, CGPoint(x: 20, y: 30)) }
         let backend = InputToolsBackend(effects: effects)
         let result = await backend.invoke(name: "click", arguments: arguments(["x": 40, "y": 60, "modifier": ["cmd"]]))
         XCTAssertFalse(result.isError)
         XCTAssertEqual(activations, 0)
-        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.count, 3)
         for event in events {
             XCTAssertEqual(event.location, CGPoint(x: 120, y: 230))
+            XCTAssertEqual(event.getIntegerValueField(CGEventField(rawValue: 40)!), 42)
+            for field: UInt32 in [51, 91, 92] {
+                XCTAssertEqual(event.getIntegerValueField(CGEventField(rawValue: field)!), 7)
+            }
             XCTAssertTrue(event.flags.contains(.maskCommand))
             XCTAssertEqual(event.getIntegerValueField(.eventSourceUserData), ComputerUseNativeActivityMonitor.syntheticEventUserData)
         }
         let outside = await backend.invoke(name: "click", arguments: arguments(["x": 600, "y": 0]))
         XCTAssertTrue(outside.isError)
-        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.count, 3)
     }
 
     func testHumanActivityRefusesEveryMutationBeforeEffects() async {
@@ -274,7 +344,7 @@ final class InputToolsTests: XCTestCase {
         canOpen = false
         let clicked = await backend.invoke(name: "double_click", arguments: arguments(["element_id": "ax_1"]))
         XCTAssertFalse(clicked.isError)
-        XCTAssertEqual(events.map { $0.getIntegerValueField(.mouseEventClickState) }, [1, 1, 2, 2])
+        XCTAssertEqual(events.map { $0.getIntegerValueField(.mouseEventClickState) }, [0, 1, 1, 2, 2])
     }
 
     func testUnicodeDragAndHotkeyFallbackEventsStayTagged() async {
@@ -292,6 +362,9 @@ final class InputToolsTests: XCTestCase {
         XCTAssertFalse(dragged.isError)
         XCTAssertEqual(Array(events.suffix(3)).map(\.type), [.leftMouseDown, .leftMouseDragged, .leftMouseUp])
         XCTAssertEqual(events.last?.location, CGPoint(x: 110, y: 220))
+        for event in events.suffix(3) {
+            for field: UInt32 in [51, 91, 92] { XCTAssertEqual(event.getIntegerValueField(CGEventField(rawValue: field)!), 7) }
+        }
         for event in events {
             XCTAssertEqual(event.getIntegerValueField(.eventSourceUserData), ComputerUseNativeActivityMonitor.syntheticEventUserData)
         }
