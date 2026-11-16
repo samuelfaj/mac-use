@@ -1,13 +1,30 @@
 const hostName = 'io.macuse.computer_use';
+// What this file implements, reported by browser_status. Chrome keeps the manifest it first read
+// when an extension is re-enabled rather than reloaded, so the manifest version can lag the code.
+export const extensionVersion = '1.5.0';
 const sessions = new Map();
 let creatingTab = false;
 const activatedDuringCreation = new Set();
 let port;
 let requests = Promise.resolve();
+// The native host waits 35 s for an answer; answer first, even when a page never does.
+const requestDeadlineMs = 30000;
+const expired = Symbol('expired');
+
+// Resolves to `expired` when the promise takes longer; the promise itself keeps running.
+function within(promise, ms) {
+  let timer;
+  const limit = new Promise(resolve => { timer = setTimeout(() => resolve(expired), ms); });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+}
+
+// Closing is browser-side work, but nothing may hold the request queue, so it is bounded too.
+const release = session => within(handleRequest({operation: 'browser_close', session}).catch(() => {}), 5000);
 
 // Runs in this extension's isolated world, without changing page attributes
-// or exposing references to page scripts. Every action checks visibility again
-// inside the tab to close the race with the background service worker.
+// or exposing references to page scripts. The page cannot tell whether the user
+// is looking at it (keepAwake makes it report "visible"), so the service worker
+// checks tab selection before and after every call.
 export function pageOperation(operation, args) {
   // executeScript drops thrown messages; with reportErrors the reason is returned instead.
   try {
@@ -27,6 +44,9 @@ export function pageOperation(operation, args) {
       // A shadow host is how elementFromPoint reports its own shadow content.
       return element.getRootNode?.().host !== top;
     };
+    // Styled switches and checkboxes hide the real input and draw its label instead.
+    const shown = element => (!elementVisible(element) && ['checkbox', 'radio'].includes(element.type)
+      && Array.from(element.labels || []).find(elementVisible)) || element;
     const liveRegion = element => ['status', 'alert'].includes(element.getAttribute('role')) || element.getAttribute('aria-live') !== null;
     const elementSignature = element => ({
       role: element.getAttribute('role') || element.tagName.toLowerCase(),
@@ -37,15 +57,12 @@ export function pageOperation(operation, args) {
       href: element.getAttribute('href') || '',
       value: element.type === 'password' ? '' : String(element.value ?? '').slice(0, 1000)
     });
-    if (document.visibilityState !== 'hidden') {
-      throw new Error('human_activity: the tab is visible; select another tab before continuing.');
-    }
     if (operation === 'browser_act') {
       const snapshot = globalThis.__macUseSnapshot;
       const entry = snapshot?.get(args.ref);
       const element = entry?.element;
       if (args.action !== 'scroll' || args.ref) {
-        if (!entry || !element?.isConnected || !elementVisible(element)
+        if (!entry || !element?.isConnected || !elementVisible(shown(element))
             || JSON.stringify(elementSignature(element)) !== JSON.stringify(entry.signature)) {
           throw new Error('stale_reference: take a new browser_snapshot.');
         }
@@ -53,7 +70,7 @@ export function pageOperation(operation, args) {
       if (element && (element.disabled || element.getAttribute('aria-disabled') === 'true')) {
         throw new Error('The element is disabled.');
       }
-      if (element && args.action !== 'scroll' && elementCovered(element)) throw new Error('element is covered');
+      if (element && args.action !== 'scroll' && elementCovered(shown(element))) throw new Error('element is covered');
       switch (args.action) {
         case 'click':
           element.click();
@@ -93,8 +110,16 @@ export function pageOperation(operation, args) {
     const token = crypto.randomUUID();
     const refs = new Map();
     let extraLive = 0;
+    // A query narrows the snapshot before the cap, so a control past the first 200 can be found.
+    const needles = String(args?.query ?? '').toLowerCase().split('|').map(part => part.trim()).filter(Boolean);
+    const wanted = element => {
+      if (!needles.length) return true;
+      const {role, name, value} = elementSignature(element);
+      const haystack = `${role}\n${name}\n${value}`.toLowerCase();
+      return needles.some(needle => haystack.includes(needle));
+    };
     const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role],[tabindex],[contenteditable],[aria-live]'))
-      .filter(elementVisible)
+      .filter(element => elementVisible(shown(element)) && wanted(element))
       .filter((element, index) => index < 200 || (liveRegion(element) && ++extraLive <= 20)).map((element, index) => {
         const ref = `${token}.${index}`;
         const signature = elementSignature(element);
@@ -104,7 +129,7 @@ export function pageOperation(operation, args) {
           item.options = Array.from(element.options).slice(0, 50).map(option => ({value: option.value, text: option.text.trim()}));
           item.selected = element.value;
         }
-        if (elementCovered(element)) item.covered = true;
+        if (elementCovered(shown(element))) item.covered = true;
         if (liveRegion(element)) {
           const rect = element.getBoundingClientRect();
           if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= globalThis.innerHeight || rect.left >= globalThis.innerWidth) item.offscreen = true;
@@ -112,8 +137,9 @@ export function pageOperation(operation, args) {
         return item;
       });
     globalThis.__macUseSnapshot = refs;
+    // The page text is the bulk of a snapshot; a caller that asked for specific controls does not need it.
     return {url: location.href, title: document.title, ready: document.readyState === 'complete',
-      text: (document.body?.innerText || '').slice(0, 16000), elements};
+      ...(needles.length ? {} : {text: (document.body?.innerText || '').slice(0, 16000)}), elements};
   } catch (error) {
     if (args?.reportErrors) return {error: String(error?.message || error)};
     throw error;
@@ -170,15 +196,15 @@ export function settlePoll() {
 const settleLimits = {pollMs: 50, quietMs: 150, idleCapMs: 2000, pendingCapMs: 10000};
 
 // Polled from the service worker because timers in a background tab are throttled.
-export async function settle(session, limits = settleLimits) {
+export async function settle(session, limits = settleLimits, ctx) {
   const start = Date.now();
   let lastPending = start;
   for (;;) {
     await new Promise(resolve => setTimeout(resolve, limits.pollMs));
-    const tab = await ownedTab(session);
+    const tab = await ownedTab(session, ctx);
     let poll;
     try {
-      [{result: poll}] = await executePageScript({target: {tabId: tab.id}, world: 'MAIN', func: settlePoll});
+      [{result: poll}] = await executePageScript({target: {tabId: tab.id}, world: 'MAIN', func: settlePoll}, ctx);
     } catch {
       poll = {pending: 1, idle: 0};
     }
@@ -202,14 +228,37 @@ async function groupTab(tab) {
   return groupId;
 }
 
-async function ownedTab(session) {
+// ctx belongs to one request: `aborted` stops a request that outlived its deadline from acting
+// later, and `allowActive` is the caller's decision to act on a tab the user is using.
+async function ownedTab(session, ctx) {
+  if (ctx?.aborted) throw new Error('This request was abandoned after its deadline.');
   const entry = sessions.get(session);
   if (!entry) throw new Error('No owned tab. Use browser_open first.');
   const tab = await chrome.tabs.get(entry.tabId);
-  if (entry.takenOver || tab.active) {
-    throw new Error('human_activity: you selected this tab. Use browser_close to release it, then browser_open for a new background tab.');
+  if ((entry.takenOver || tab.active) && !ctx?.allowActive) {
+    throw new Error('human_activity: the user selected this tab. Prefer browser_close, then browser_open for a new background tab. If the work must happen in this tab, retry with allow_while_user_active: true, unless the user said not to interrupt them.');
   }
   return tab;
+}
+
+// A hidden tab renders no frames, so dialogs and animated UI never appear, and Chrome freezes
+// tabs in a collapsed group, so page scripts never return. Focus emulation keeps the owned tab
+// rendering and unfrozen while it stays a background tab. The debugger stays attached (Chrome
+// shows its yellow bar) until browser_close.
+async function keepAwake(tabId) {
+  let state = debuggerTabs.get(tabId);
+  if (!state) {
+    await chrome.debugger.attach({tabId}, '1.3');
+    state = {};
+    debuggerTabs.set(tabId, state);
+  }
+  if (!state.awake) {
+    await chrome.debugger.sendCommand({tabId}, 'Emulation.setFocusEmulationEnabled', {enabled: true});
+    // Page events report a JavaScript dialog, which blocks every script in the page.
+    await chrome.debugger.sendCommand({tabId}, 'Page.enable');
+    state.awake = true;
+  }
+  return state;
 }
 
 function validURL(raw) {
@@ -218,10 +267,13 @@ function validURL(raw) {
   return url.href;
 }
 
-export async function handleRequest(request) {
+export async function handleRequest(request, ctx = {}) {
   const {operation, session, arguments: args = {}} = request;
   if (typeof session !== 'string' || !/^[a-f0-9-]{36}$/i.test(session)) throw new Error('Invalid browser session.');
-  if (operation === 'browser_status') return {connected: true, mode: 'current_chrome_profile', hasTab: sessions.has(session)};
+  if (args.allow_while_user_active !== undefined && typeof args.allow_while_user_active !== 'boolean') throw new Error('allow_while_user_active must be a boolean.');
+  if (args.query !== undefined && typeof args.query !== 'string') throw new Error('query must be a string.');
+  ctx.allowActive = args.allow_while_user_active === true;
+  if (operation === 'browser_status') return {connected: true, mode: 'current_chrome_profile', hasTab: sessions.has(session), version: extensionVersion};
   if (operation === 'browser_close') {
     const entry = sessions.get(session);
     if (!entry) return {closed: false, released: false};
@@ -263,88 +315,85 @@ export async function handleRequest(request) {
     activatedDuringCreation.clear();
     if (!tab.active && !sessions.get(session)?.takenOver) {
       await chrome.tabs.update(tab.id, {muted: true});
+      // Wake the tab before it joins the collapsed group. The next call retries a failed attach.
+      try { await keepAwake(tab.id); } catch {}
       // Grouping is cosmetic; a failure must not fail browser_open.
       try { sessions.get(session).groupId = await groupTab(tab); } catch {}
     }
     return {url, loading: true, next: 'Use browser_snapshot to read the page after navigation.'};
   }
-  if (extendedTools.includes(operation)) return extendedRequest(operation, session, args);
+  if (extendedTools.includes(operation)) return extendedRequest(operation, session, args, ctx);
   if (!['browser_snapshot', 'browser_act'].includes(operation)) throw new Error('Unknown browser operation.');
   if (operation === 'browser_act') {
     if (!['click', 'fill', 'type', 'scroll'].includes(args.action)) throw new Error('Unsupported browser action.');
     if (args.action !== 'scroll' && typeof args.ref !== 'string') throw new Error('An element ref from browser_snapshot is required.');
     if (['delta_x', 'delta_y'].some(key => args[key] !== undefined && !Number.isFinite(args[key]))) throw new Error('Scroll distances must be finite.');
   }
-  let tab = await ownedTab(session);
+  let tab = await ownedTab(session, ctx);
+  // Snapshots and DOM actions do not need the debugger; without it the deadline still bounds the call.
+  try { await keepAwake(tab.id); } catch {}
+  if (debuggerTabs.get(tab.id)?.dialog) return {dialog: debuggerTabs.get(tab.id).dialog};
   if (tab.status === 'loading') {
     if (operation === 'browser_act') throw new Error('The page is still loading. Take a browser_snapshot again shortly.');
     const deadline = Date.now() + 10000;
     while (tab.status === 'loading' && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 50));
-      tab = await ownedTab(session);
+      tab = await ownedTab(session, ctx);
     }
     if (tab.status === 'loading') throw new Error('The page did not finish loading within 10 seconds.');
   }
   if (new URL(tab.url).protocol !== 'about:') validURL(tab.url);
-  const run = (world, func, funcArgs) => executePageScript({target: {tabId: tab.id}, world, func, args: funcArgs});
+  const run = (world, func, funcArgs) => executePageScript({target: {tabId: tab.id}, world, func, args: funcArgs}, ctx);
   if (operation === 'browser_act') await run('MAIN', settleBegin);
   let results = await run('ISOLATED', pageOperation, [operation, operation === 'browser_act' ? {...args, reportErrors: true} : args]);
   let settled = {};
   if (operation === 'browser_act') {
     if (results[0]?.result?.error) throw new Error(results[0].result.error);
     if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
-    settled = await settle(session);
+    settled = await settle(session, settleLimits, ctx);
     // Refs from the pre-settle snapshot are replaced by one that shows the settled page.
     results = await run('ISOLATED', pageOperation, ['browser_snapshot', {}]);
   }
-  if (sessions.get(session)?.takenOver || (await chrome.tabs.get(tab.id)).active) {
-    throw new Error('human_activity: you selected this tab. No result will be returned.');
-  }
+  // Selection during the call withholds the result: it may show what the user is now doing.
+  await ownedTab(session, ctx);
   if (!results[0]?.result) throw new Error('The page did not return a snapshot.');
   return {...results[0].result, ...settled};
 }
 
-async function executePageScript(options) {
+async function executePageScript(options, ctx) {
+  if (ctx?.aborted) throw new Error('This request was abandoned after its deadline.');
   const tab = await chrome.tabs.get(options.target.tabId);
   if (new URL(tab.url).protocol !== 'about:') return chrome.scripting.executeScript(options);
+  // chrome.scripting cannot inject into about: pages; evaluate through the debugger instead.
   const source = {tabId: tab.id};
-  const alreadyAttached = debuggerTabs.has(tab.id);
-  if (!alreadyAttached) {
-    await chrome.debugger.attach(source, '1.3');
-    debuggerTabs.set(tab.id, {});
-  }
-  const state = debuggerTabs.get(tab.id);
+  const state = await keepAwake(tab.id);
   const command = (method, params = {}) => chrome.debugger.sendCommand(source, method, params);
-  try {
-    if (tab.active || [...sessions.values()].some(entry => entry.tabId === tab.id && entry.takenOver)) throw new Error('human_activity: the tab is visible.');
-    await command('Page.enable');
-    const {frameTree} = await command('Page.getFrameTree');
-    let contextId;
-    if (options.world !== 'MAIN') {
-      ({executionContextId: contextId} = await command('Page.createIsolatedWorld', {frameId: frameTree.frame.id, worldName: 'mac-use-about'}));
-      state.contextId = contextId;
-    }
-    const result = await command('Runtime.evaluate', {
-      expression: `(${options.func.toString()})(...${JSON.stringify(options.args || [])})`,
-      ...(contextId ? {contextId} : {}), returnByValue: true
-    });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
-    return [{result: result.result?.value}];
-  } finally {
-    if (!alreadyAttached && !state.dialog) {
-      await chrome.debugger.detach(source);
-      debuggerTabs.delete(tab.id);
-    }
+  await command('Page.enable');
+  const {frameTree} = await command('Page.getFrameTree');
+  let contextId;
+  if (options.world !== 'MAIN') {
+    ({executionContextId: contextId} = await command('Page.createIsolatedWorld', {frameId: frameTree.frame.id, worldName: 'mac-use-about'}));
+    state.contextId = contextId;
   }
+  const result = await command('Runtime.evaluate', {
+    expression: `(${options.func.toString()})(...${JSON.stringify(options.args || [])})`,
+    ...(contextId ? {contextId} : {}), returnByValue: true
+  });
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+  return [{result: result.result?.value}];
 }
 
-// Debugger attaches only during calls. An open dialog keeps it attached until handled.
-// Dialogs opened while detached are not observable; inspect enables Page for this call.
+// Per-tab debugger state, attached by keepAwake for as long as the tab is owned.
+// Dialogs opened while detached are not observable.
 const debuggerTabs = new Map();
+const dialogWaiters = new Set();
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const state = debuggerTabs.get(source.tabId);
   if (!state) return;
-  if (method === 'Page.javascriptDialogOpening') state.dialog = params;
+  if (method === 'Page.javascriptDialogOpening') {
+    state.dialog = params;
+    for (const waiter of dialogWaiters) if (waiter.tabId === source.tabId) waiter.opened();
+  }
   if (method === 'Page.javascriptDialogClosed') state.dialog = undefined;
   if (method === 'Runtime.executionContextCreated') {
     const context = params.context;
@@ -360,7 +409,6 @@ const extendedTools = ['browser_navigate', 'browser_click', 'browser_type', 'bro
 export function resolveTarget(args) {
   // executeScript drops thrown messages; with reportErrors the reason is returned instead.
   try {
-    if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
     const element = args.ref ? globalThis.__macUseSnapshot?.get(args.ref)?.element
       : args.css_selector ? document.querySelector(args.css_selector) : undefined;
     if ((args.ref || args.css_selector) && !element?.isConnected) throw new Error('stale_reference: take a new browser_snapshot.');
@@ -393,7 +441,6 @@ export function resolveTarget(args) {
 }
 
 export function pageQuery(args) {
-  if (document.visibilityState !== 'hidden') throw new Error('human_activity: the tab is visible.');
   if (args.action === 'get_text') return (args.css_selector ? document.querySelector(args.css_selector) : document.body)?.innerText || '';
   return Array.from(document.querySelectorAll(args.css_selector)).slice(0, 200).map(element => ({
     tag: element.tagName.toLowerCase(), text: element.innerText,
@@ -401,24 +448,25 @@ export function pageQuery(args) {
   }));
 }
 
-async function extendedRequest(operation, session, args) {
-  let tab = await ownedTab(session);
+async function extendedRequest(operation, session, args, ctx) {
+  let tab = await ownedTab(session, ctx);
   const run = async (func, values, world = 'ISOLATED') => {
-    await ownedTab(session);
-    const result = await executePageScript({target: {tabId: tab.id}, world, func, args: values});
+    await ownedTab(session, ctx);
+    const result = await executePageScript({target: {tabId: tab.id}, world, func, args: values}, ctx);
     if (!result[0] || result[0].error) throw new Error('Page script failed.');
-    await ownedTab(session);
+    await ownedTab(session, ctx);
     return result[0].result;
   };
-  const snapshot = async extra => ({...await handleRequest({operation: 'browser_snapshot', session}), ...extra});
+  const allow = ctx.allowActive ? {allow_while_user_active: true} : {};
+  const snapshot = async extra => ({...await handleRequest({operation: 'browser_snapshot', session, arguments: allow}, ctx), ...extra});
   if (operation === 'browser_navigate') {
     if (typeof args.url !== 'string') throw new Error('url must be a string.');
     const url = new URL(args.url);
     if (!['http:', 'https:', 'about:'].includes(url.protocol)) throw new Error('Only HTTP, HTTPS and about URLs are supported.');
     await run(() => { globalThis.__macUseSnapshot = undefined; }, []);
-    await ownedTab(session);
+    await ownedTab(session, ctx);
     await chrome.tabs.update(tab.id, {url: url.href});
-    await settle(session);
+    await settle(session, settleLimits, ctx);
     return snapshot({});
   }
   if (operation === 'page') {
@@ -430,18 +478,18 @@ async function extendedRequest(operation, session, args) {
       return {result: await run(pageQuery, [args])};
     }
     if (args.action !== 'execute_javascript') return extendedRequest(args.action === 'click_element' ? 'browser_click' : 'browser_type', session,
-      {...args, mode: args.action === 'type_keystrokes' ? 'keystrokes' : 'insert_text'});
+      {...args, mode: args.action === 'type_keystrokes' ? 'keystrokes' : 'insert_text'}, ctx);
     if (typeof args.javascript !== 'string') throw new Error('javascript is required.');
   }
   if (operation === 'browser_download') {
     if (typeof args.ref !== 'string' || typeof args.directory !== 'string' || !args.directory.startsWith('/')) throw new Error('ref and absolute directory are required.');
     const target = await run(resolveTarget, [args]);
     const url = validURL(target.href);
-    await ownedTab(session);
+    await ownedTab(session, ctx);
     const id = await chrome.downloads.download({url, filename: `mac-use/${crypto.randomUUID()}`, saveAs: false, conflictAction: 'uniquify'});
     const deadline = Date.now() + 10000;
     for (;;) {
-      await ownedTab(session);
+      await ownedTab(session, ctx);
       const [item] = await chrome.downloads.search({id});
       if (item?.state === 'complete') {
         try { return await snapshot({download_path: item.filename}); }
@@ -461,114 +509,122 @@ async function extendedRequest(operation, session, args) {
   if (operation === 'browser_set_input_files' && (typeof args.ref !== 'string' || !Array.isArray(args.paths) || args.paths.some(p => typeof p !== 'string' || !p.startsWith('/') || p.includes('\0')))) throw new Error('ref and absolute paths are required.');
   if (operation === 'browser_pointer' && !['hover', 'right_click', 'double_click', 'scroll', 'drag'].includes(args.action)) throw new Error('Unsupported pointer action.');
   const source = {tabId: tab.id};
-  let state = debuggerTabs.get(tab.id);
-  if (!state) {
-    await chrome.debugger.attach(source, '1.3');
-    state = {};
-    debuggerTabs.set(tab.id, state);
-  }
+  const state = await keepAwake(tab.id);
+  if (state.dialog && operation !== 'browser_dialog') return {dialog: state.dialog};
   const command = async (method, params = {}) => {
-    await ownedTab(session);
+    await ownedTab(session, ctx);
     const result = await chrome.debugger.sendCommand(source, method, params);
-    await ownedTab(session);
+    await ownedTab(session, ctx);
     return result;
   };
-  try {
-    await command('Page.enable');
-    await command('Runtime.enable');
-    if (operation === 'browser_dialog') {
-      if (args.action === 'inspect') return {dialog: state.dialog || null};
-      await command('Page.handleJavaScriptDialog', {accept: args.action === 'accept', ...(args.prompt_text === undefined ? {} : {promptText: args.prompt_text})});
-      state.dialog = undefined;
-    } else if (operation === 'browser_set_input_files') {
-      if (!state.contextId) throw new Error('Snapshot execution context unavailable. Take a browser_snapshot first.');
-      const result = await command('Runtime.evaluate', {contextId: state.contextId,
-        expression: `(() => { const element = globalThis.__macUseSnapshot?.get(${JSON.stringify(args.ref)})?.element; return element?.isConnected ? element : null; })()`, returnByValue: false});
-      if (!result.result?.objectId || result.exceptionDetails) throw new Error('stale_reference: take a new browser_snapshot.');
-      const objectId = result.result.objectId;
-      try {
-        const {node} = await command('DOM.describeNode', {objectId});
-        if (node.attributes?.includes('disabled')) throw new Error('The element is disabled.');
-        if (node.nodeName !== 'INPUT' || !node.attributes?.some((value, index, all) => value === 'type' && all[index + 1] === 'file')) throw new Error('Reference is not a file input.');
-        await command('DOM.setFileInputFiles', {backendNodeId: node.backendNodeId, files: args.paths});
-      } finally { await command('Runtime.releaseObject', {objectId}); }
-    } else if (operation === 'page') {
-      const result = await command('Runtime.evaluate', {expression: args.javascript, returnByValue: true, awaitPromise: false});
-      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'JavaScript failed.');
-      if (state.dialog) return {dialog: state.dialog};
-      await settle(session);
-      return snapshot({result: result.result?.value ?? null});
-    } else {
-      const point = async values => {
-        const point = await run(resolveTarget, [{...values, reportErrors: true}]);
-        if (point?.error) throw new Error(point.error);
-        if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y) || point.x < 0 || point.y < 0) throw new Error('A ref or finite viewport x,y is required.');
-        return {x: point.x, y: point.y};
-      };
-      const trustedInput = (reset = false) => run(() => {
-        if (!globalThis.__macUseInputListenerInstalled) {
-          for (const type of ['mousedown', 'wheel', 'keydown'])
-            window.addEventListener(type, () => { globalThis.__macUseInputSeen = (globalThis.__macUseInputSeen || 0) + 1; }, true);
-          globalThis.__macUseInputListenerInstalled = true;
-        }
-        if (reset) globalThis.__macUseInputSeen = 0;
-        return globalThis.__macUseInputSeen || 0;
-      }, [], 'MAIN');
-      // Unfocused background tabs drop presses and keys; emulate focus only while dispatching,
-      // after resolveTarget has checked visibility (emulation makes the tab look visible).
-      const focused = async dispatch => {
-        await command('Emulation.setFocusEmulationEnabled', {enabled: true});
-        try { await dispatch(); } finally { await command('Emulation.setFocusEmulationEnabled', {enabled: false}); }
-      };
-      const mouse = (type, position, extra = {}) => command('Input.dispatchMouseEvent', {type, ...position, ...extra});
-      const click = async (position, button, count) => {
-        if (!['left', 'right', 'middle'].includes(button) || ![1, 2, 3].includes(count)) throw new Error('Invalid button or click_count.');
-        for (let n = 1; n <= count; n++) {
-          await mouse('mouseMoved', position);
-          await mouse('mousePressed', position, {button, clickCount: n});
-          await mouse('mouseReleased', position, {button, clickCount: n});
-        }
-      };
-      const checksTrustedInput = operation === 'browser_type' ? (args.mode ?? 'insert_text') === 'keystrokes' : !(operation === 'browser_pointer' && args.action === 'hover');
-      if (checksTrustedInput) await trustedInput(true);
-      if (operation === 'browser_type') {
-        if (args.ref || args.css_selector) await point({...args, focus: true});
-        if ((args.mode ?? 'insert_text') === 'insert_text') await command('Input.insertText', {text: args.text});
-        else await focused(async () => {
-          for (const key of args.text) {
-            await command('Input.dispatchKeyEvent', {type: 'keyDown', key, text: key});
-            await command('Input.dispatchKeyEvent', {type: 'keyUp', key});
-          }
-        });
-      } else {
-        const position = await point(args);
-        const destination = operation === 'browser_pointer' && args.action === 'drag' ? await point({ref: args.to_ref, x: args.to_x, y: args.to_y}) : null;
-        await focused(async () => {
-        if (operation === 'browser_click') await click(position, args.button ?? 'left', args.click_count ?? 1);
-        else if (args.action === 'hover') await mouse('mouseMoved', position);
-        else if (args.action === 'right_click' || args.action === 'double_click') await click(position, args.action === 'right_click' ? 'right' : 'left', args.action === 'double_click' ? 2 : 1);
-        else if (args.action === 'scroll') {
-          const deltaX = args.delta_x ?? 0, deltaY = args.delta_y ?? 600;
-          if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('Scroll distances must be finite.');
-          await mouse('mouseWheel', position, {deltaX, deltaY});
-        } else {
-          await mouse('mousePressed', position, {button: 'left', clickCount: 1});
-          try { await mouse('mouseMoved', destination, {button: 'left', buttons: 1}); }
-          finally { await mouse('mouseReleased', destination, {button: 'left', clickCount: 1}); }
-        }
-        });
-      }
-      if (checksTrustedInput && await trustedInput() === 0) throw new Error('trusted_input_not_delivered: Chrome dropped trusted input to this background tab; use browser_act (click/fill/type) or browser_type mode insert_text.');
-    }
+  // The browser handles a dialog by itself; the page answers nothing while one is open.
+  if (operation !== 'browser_dialog') await command('Runtime.enable');
+  if (operation === 'browser_dialog') {
+    if (args.action === 'inspect') return {dialog: state.dialog || null};
+    await command('Page.handleJavaScriptDialog', {accept: args.action === 'accept', ...(args.prompt_text === undefined ? {} : {promptText: args.prompt_text})});
+    state.dialog = undefined;
+  } else if (operation === 'browser_set_input_files') {
+    if (!state.contextId) throw new Error('Snapshot execution context unavailable. Take a browser_snapshot first.');
+    const result = await command('Runtime.evaluate', {contextId: state.contextId,
+      expression: `(() => { const element = globalThis.__macUseSnapshot?.get(${JSON.stringify(args.ref)})?.element; return element?.isConnected ? element : null; })()`, returnByValue: false});
+    if (!result.result?.objectId || result.exceptionDetails) throw new Error('stale_reference: take a new browser_snapshot.');
+    const objectId = result.result.objectId;
+    try {
+      const {node} = await command('DOM.describeNode', {objectId});
+      if (node.attributes?.includes('disabled')) throw new Error('The element is disabled.');
+      if (node.nodeName !== 'INPUT' || !node.attributes?.some((value, index, all) => value === 'type' && all[index + 1] === 'file')) throw new Error('Reference is not a file input.');
+      await command('DOM.setFileInputFiles', {backendNodeId: node.backendNodeId, files: args.paths});
+    } finally { await command('Runtime.releaseObject', {objectId}); }
+  } else if (operation === 'page') {
+    const result = await command('Runtime.evaluate', {expression: args.javascript, returnByValue: true, awaitPromise: false});
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'JavaScript failed.');
     if (state.dialog) return {dialog: state.dialog};
-    await settle(session);
-    return snapshot({});
-  } finally {
-    if (!state.dialog) {
-      await chrome.debugger.detach(source);
-      debuggerTabs.delete(tab.id);
+    await settle(session, settleLimits, ctx);
+    return snapshot({result: result.result?.value ?? null});
+  } else {
+    const point = async values => {
+      const point = await run(resolveTarget, [{...values, reportErrors: true}]);
+      if (point?.error) throw new Error(point.error);
+      if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y) || point.x < 0 || point.y < 0) throw new Error('A ref or finite viewport x,y is required.');
+      return {x: point.x, y: point.y};
+    };
+    const trustedInput = (reset = false) => run(() => {
+      if (!globalThis.__macUseInputListenerInstalled) {
+        for (const type of ['mousedown', 'wheel', 'keydown'])
+          window.addEventListener(type, () => { globalThis.__macUseInputSeen = (globalThis.__macUseInputSeen || 0) + 1; }, true);
+        globalThis.__macUseInputListenerInstalled = true;
+      }
+      if (reset) globalThis.__macUseInputSeen = 0;
+      return globalThis.__macUseInputSeen || 0;
+    }, [], 'MAIN');
+    const mouse = (type, position, extra = {}) => command('Input.dispatchMouseEvent', {type, ...position, ...extra});
+    const click = async (position, button, count) => {
+      if (!['left', 'right', 'middle'].includes(button) || ![1, 2, 3].includes(count)) throw new Error('Invalid button or click_count.');
+      for (let n = 1; n <= count; n++) {
+        await mouse('mouseMoved', position);
+        await mouse('mousePressed', position, {button, clickCount: n});
+        await mouse('mouseReleased', position, {button, clickCount: n});
+      }
+    };
+    const checksTrustedInput = operation === 'browser_type' ? (args.mode ?? 'insert_text') === 'keystrokes' : !(operation === 'browser_pointer' && args.action === 'hover');
+    if (checksTrustedInput) await trustedInput(true);
+    if (operation === 'browser_type') {
+      if (args.ref || args.css_selector) await point({...args, focus: true});
+      if ((args.mode ?? 'insert_text') === 'insert_text') await command('Input.insertText', {text: args.text});
+      else for (const key of args.text) {
+        await command('Input.dispatchKeyEvent', {type: 'keyDown', key, text: key});
+        await command('Input.dispatchKeyEvent', {type: 'keyUp', key});
+      }
+    } else {
+      const position = await point(args);
+      const destination = operation === 'browser_pointer' && args.action === 'drag' ? await point({ref: args.to_ref, x: args.to_x, y: args.to_y}) : null;
+      if (operation === 'browser_click') await click(position, args.button ?? 'left', args.click_count ?? 1);
+      else if (args.action === 'hover') await mouse('mouseMoved', position);
+      else if (args.action === 'right_click' || args.action === 'double_click') await click(position, args.action === 'right_click' ? 'right' : 'left', args.action === 'double_click' ? 2 : 1);
+      else if (args.action === 'scroll') {
+        const deltaX = args.delta_x ?? 0, deltaY = args.delta_y ?? 600;
+        if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('Scroll distances must be finite.');
+        await mouse('mouseWheel', position, {deltaX, deltaY});
+      } else {
+        await mouse('mousePressed', position, {button: 'left', clickCount: 1});
+        try { await mouse('mouseMoved', destination, {button: 'left', buttons: 1}); }
+        finally { await mouse('mouseReleased', destination, {button: 'left', clickCount: 1}); }
+      }
     }
+    if (checksTrustedInput && await trustedInput() === 0) throw new Error('trusted_input_not_delivered: Chrome dropped trusted input to this tab; use browser_act (click/fill/type) or browser_type mode insert_text.');
   }
+  if (state.dialog) return {dialog: state.dialog};
+  await settle(session, settleLimits, ctx);
+  return snapshot({});
+}
+
+// One page that never answers (frozen, discarded or stuck in script) must not hold the queue
+// and starve every later request. The abandoned request is aborted so it cannot act when the
+// page wakes, and its tab is closed because an injected script may already be queued there.
+// A JavaScript dialog also blocks the page, but only until browser_dialog handles it, so the
+// call that opened it reports the dialog and keeps the tab.
+export async function runRequest(request, deadlineMs = requestDeadlineMs, dialogGraceMs = 250) {
+  const ctx = {aborted: false};
+  const blocked = Symbol('blocked');
+  const tabId = sessions.get(request.session)?.tabId;
+  const waiter = {tabId};
+  const dialog = new Promise(resolve => { waiter.opened = () => resolve(blocked); });
+  dialogWaiters.add(waiter);
+  const work = handleRequest(request, ctx);
+  work.catch(() => {});
+  let outcome;
+  try {
+    outcome = await Promise.race([within(work, deadlineMs), dialog]);
+    // Input that was only dispatched may still return by itself; give it a moment.
+    if (outcome === blocked && await within(work, dialogGraceMs) !== expired) outcome = await work;
+    if (outcome !== expired && outcome !== blocked) return outcome;
+  } finally {
+    dialogWaiters.delete(waiter);
+    ctx.aborted = true;
+  }
+  if (outcome === blocked && debuggerTabs.get(tabId)?.dialog) return {dialog: debuggerTabs.get(tabId).dialog};
+  await release(request.session);
+  throw new Error(`tab_unresponsive: the page did not answer within ${deadlineMs / 1000} seconds, so its tab was released. Use browser_open again.`);
 }
 
 function badge(text, title) {
@@ -582,9 +638,7 @@ function disconnected(connection, error) {
   badge('OFF', error || 'mac-use disconnected. Reconnecting automatically; click to retry now.');
   // Let any running request settle before releasing session handles.
   requests = requests.then(async () => {
-    for (const session of [...sessions.keys()]) {
-      await handleRequest({operation: 'browser_close', session}).catch(() => {});
-    }
+    for (const session of [...sessions.keys()]) await release(session);
   });
 }
 
@@ -598,7 +652,7 @@ function connect() {
     requests = requests.then(async () => {
       if (port !== connection) return;
       let response;
-      try { response = {id: request.id, ok: true, ...(await handleRequest(request))}; }
+      try { response = {id: request.id, ok: true, ...(await runRequest(request))}; }
       catch (error) { response = {id: request.id, ok: false, error: String(error.message || error)}; }
       if (port === connection) connection.postMessage(response);
     }).catch(() => {});

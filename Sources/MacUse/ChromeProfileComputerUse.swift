@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -20,8 +21,58 @@ public enum ChromeProfileConnection {
     public static var socketPath: String { directory.appendingPathComponent("bridge.sock").path }
 
     struct Failure: Error, LocalizedError {
+        enum Kind { case notConnected, closed, timedOut, other }
         let message: String
+        var kind: Kind = .other
         var errorDescription: String? { message }
+    }
+
+    /// The extension version that keeps its tab awake and answers every request before the host's limit.
+    public static let minimumExtensionVersion = "1.5.0"
+
+    public static func chromeIsRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty
+    }
+
+    /// Chrome starts the host only while the extension holds its port, so a listening socket
+    /// means the extension is installed, enabled and connected.
+    public static func hostListening(path: String = socketPath) -> Bool {
+        guard var address = try? address(path) else { return false }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        } == 0
+    }
+
+    /// What can be known about the extension without waiting on a page: installed, connected,
+    /// answering and recent enough. Never throws: a status question deserves a status answer.
+    public static func extensionStatus(
+        session: String = UUID().uuidString, timeout: TimeInterval = 2,
+        registered: Bool = installedExtensionID() != nil,
+        send: ([String: Any], TimeInterval) throws -> [String: Any] = { try request($0, timeout: $1) }
+    ) -> [String: Any] {
+        guard registered else {
+            return ["connected": false, "state": "not_installed",
+                    "hint": "Load the chrome-extension folder in chrome://extensions, then run: mac-use-mcp install-chrome-host <extension id>."]
+        }
+        do {
+            var status = try send(["operation": "browser_status", "session": session, "arguments": [String: Any]()], timeout)
+            status.removeValue(forKey: "id")
+            let version = status["version"] as? String
+            if let version, version.compare(minimumExtensionVersion, options: .numeric) != .orderedAscending {
+                status["state"] = "connected"
+            } else {
+                status["state"] = "outdated"
+                status["hint"] = "Chrome is running an older copy of the extension than this server needs (\(minimumExtensionVersion)); background tabs can freeze. Reload it in chrome://extensions."
+            }
+            return status
+        } catch let failure as Failure where failure.kind == .timedOut {
+            return ["connected": true, "state": "busy", "hint": "The extension is connected and running another request. Retry shortly."]
+        } catch {
+            return ["connected": false, "state": "not_connected", "hint": error.localizedDescription]
+        }
     }
 
     static func address(_ path: String) throws -> sockaddr_un {
@@ -41,12 +92,12 @@ public enum ChromeProfileConnection {
     static func wait(_ fd: Int32, events: Int16, until deadline: Date) throws {
         while true {
             let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { throw Failure(message: "Chrome bridge timed out. Check the tab before retrying an action.") }
+            guard remaining > 0 else { throw Failure(message: "Chrome bridge timed out. Check the tab before retrying an action.", kind: .timedOut) }
             var descriptor = pollfd(fd: fd, events: events, revents: 0)
             let result = poll(&descriptor, 1, Int32(min(remaining * 1000, 30_000)))
             if result < 0 && errno == EINTR { continue }
             guard result > 0, descriptor.revents & events != 0 else {
-                throw Failure(message: "Chrome bridge disconnected or timed out. Check the tab before retrying an action.")
+                throw Failure(message: "Chrome bridge disconnected or timed out. Check the tab before retrying an action.", kind: result == 0 ? .timedOut : .closed)
             }
             return
         }
@@ -60,7 +111,9 @@ public enum ChromeProfileConnection {
                 try wait(fd, events: Int16(POLLIN), until: deadline)
                 let size = Darwin.read(fd, buffer.baseAddress!.advanced(by: offset), count - offset)
                 if size < 0 && errno == EINTR { continue }
-                guard size > 0 else { throw Failure(message: "Chrome bridge closed the connection.") }
+                guard size > 0 else {
+                    throw Failure(message: "The Chrome extension stopped answering and its bridge restarted. It reconnects by itself; call browser_status, then retry.", kind: .closed)
+                }
                 offset += size
             }
         }
@@ -101,21 +154,34 @@ public enum ChromeProfileConnection {
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
     }
 
-    public static func request(_ object: [String: Any], path: String = socketPath) throws -> [String: Any] {
+    /// `timeout` outlasts the extension (30 s) and the host (35 s) by default.
+    public static func request(_ object: [String: Any], path: String = socketPath, timeout: TimeInterval = 40,
+                               chromeRunning: () -> Bool = chromeIsRunning) throws -> [String: Any] {
         var address = try address(path)
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw Failure(message: "Could not create Chrome bridge connection.") }
+        let start = Date()
+        var fd: Int32 = -1
+        while true {
+            fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { throw Failure(message: "Could not create Chrome bridge connection.") }
+            let connected = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            if connected == 0 { break }
+            Darwin.close(fd)
+            let running = chromeRunning()
+            // The extension reconnects about a second after a drop; wait that out while Chrome is up.
+            guard running, Date().timeIntervalSince(start) < min(3, timeout / 2) else {
+                throw Failure(message: running
+                    ? "The mac-use Chrome extension is not connected. It reconnects every 30 seconds; its toolbar button reconnects at once. If it is not in this Chrome profile, load the chrome-extension folder in chrome://extensions."
+                    : "Google Chrome is not running, so the mac-use extension is not connected.", kind: .notConnected)
+            }
+            usleep(100_000)
+        }
         defer { Darwin.close(fd) }
         noSIGPIPE(fd)
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connected == 0 else {
-            throw Failure(message: "Chrome extension is not connected. In mac-use, open Settings > Computer Use > Set Up Chrome Extension. If already installed, click its toolbar button in the Chrome profile you want to use.")
-        }
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = start.addingTimeInterval(timeout)
         var request = object
         let id = UUID().uuidString
         request["id"] = id
@@ -127,8 +193,10 @@ public enum ChromeProfileConnection {
 
     /// Chrome launches exactly this host via its allowlisted native manifest.
     /// Blocking poll keeps the connected host idle until a real request arrives.
-    public static func runHost(origin: String, path: String = socketPath) throws {
-        guard let extensionID = installedExtensionID(), origin == "chrome-extension://\(extensionID)/" else {
+    public static func runHost(origin: String, path: String = socketPath, input: Int32 = STDIN_FILENO,
+                               output: Int32 = STDOUT_FILENO, responseTimeout: TimeInterval = 35,
+                               homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws {
+        guard let extensionID = installedExtensionID(homeDirectory: homeDirectory), origin == "chrome-extension://\(extensionID)/" else {
             throw Failure(message: "Unexpected Chrome extension origin.")
         }
         let parent = URL(fileURLWithPath: path).deletingLastPathComponent()
@@ -155,7 +223,7 @@ public enum ChromeProfileConnection {
         signal(SIGPIPE, SIG_IGN)
         while true {
             var descriptors = [pollfd(fd: listener, events: Int16(POLLIN), revents: 0),
-                               pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)]
+                               pollfd(fd: input, events: Int16(POLLIN), revents: 0)]
             let ready = poll(&descriptors, 2, -1)
             if ready < 0 && errno == EINTR { continue }
             // Chrome's pipe closing means the extension disconnected. Never
@@ -169,9 +237,18 @@ public enum ChromeProfileConnection {
             let request: [String: Any]
             do { request = try readFrame(fd: client, until: Date().addingTimeInterval(2)) }
             catch { continue }
-            let deadline = Date().addingTimeInterval(15)
-            try writeFrame(request, fd: STDOUT_FILENO, until: deadline)
-            let response = try readFrame(fd: STDIN_FILENO, until: deadline)
+            let deadline = Date().addingTimeInterval(responseTimeout)
+            try writeFrame(request, fd: output, until: deadline)
+            let response: [String: Any]
+            do { response = try readFrame(fd: input, until: deadline) }
+            catch {
+                // Say why before exiting; a silent close reads as a dead bridge. Chrome starts a
+                // clean host when the extension reconnects.
+                try? writeFrame(["id": request["id"] ?? "", "ok": false,
+                                 "error": "Chrome extension did not answer. It reconnects by itself; check browser_status before retrying."],
+                                fd: client, until: Date().addingTimeInterval(1))
+                throw error
+            }
             guard response["id"] as? String == request["id"] as? String else {
                 throw Failure(message: "Unexpected Chrome response. Reconnect the extension.")
             }
@@ -257,14 +334,30 @@ public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unc
             properties = ["action": ["type": "string", "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "insert_text", "type_keystrokes"]], "javascript": string, "css_selector": string, "attributes": ["type": "array", "items": string], "selector": string, "text": string]; required = ["action"]
         default: return nil
         }
+        if name != "browser_dialog" { properties["allow_while_user_active"] = allowWhileUserActive }
         return ["type": "object", "properties": properties, "required": required, "additionalProperties": false]
     }
+
+    /// Shared by every tool that yields to the user. Stealth stays the default; this is the escalation.
+    static let allowWhileUserActive: [String: Any] = [
+        "type": "boolean", "default": false,
+        "description": "Act even though the user is using the target. Only after the non-disturbing routes failed, and never when the user said not to interrupt them.",
+    ]
+    static let humanActivityHint = "the user is using this target. Prefer a route that does not disturb them (a background tab, an Accessibility action, or a short wait). If none works, retry with allow_while_user_active: true, unless the user said not to interrupt them."
     private let sessionID = UUID().uuidString
-    private let send: @Sendable ([String: Any]) throws -> [String: Any]
+    private let send: @Sendable ([String: Any], TimeInterval) throws -> [String: Any]
+    private let registered: @Sendable () -> Bool
     private let queue = DispatchQueue(label: "io.remotecode.chrome-profile")
 
-    public init(send: @escaping @Sendable ([String: Any]) throws -> [String: Any] = { try ChromeProfileConnection.request($0) }) {
-        self.send = send
+    /// An injected `send` stands in for a registered, connected extension.
+    public init(send: (@Sendable ([String: Any]) throws -> [String: Any])? = nil) {
+        if let send {
+            self.send = { request, _ in try send(request) }
+            registered = { true }
+        } else {
+            self.send = { try ChromeProfileConnection.request($0, timeout: $1) }
+            registered = { ChromeProfileConnection.installedExtensionID() != nil }
+        }
     }
 
     public func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
@@ -272,6 +365,12 @@ public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unc
             queue.async { [self] in
                 do {
                     guard Self.tools.contains(name) else { throw ChromeProfileConnection.Failure(message: "Unknown browser tool.") }
+                    if name == "browser_status" {
+                        let status = ChromeProfileConnection.extensionStatus(session: sessionID, registered: registered(), send: send)
+                        let data = try JSONSerialization.data(withJSONObject: status, options: [.sortedKeys])
+                        continuation.resume(returning: ComputerUseToolResult(text: String(decoding: data, as: UTF8.self)))
+                        return
+                    }
                     var downloadDirectory: URL?
                     if name == "browser_download" {
                         var isDirectory: ObjCBool = false
@@ -281,7 +380,7 @@ public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unc
                         }
                         downloadDirectory = URL(fileURLWithPath: path, isDirectory: true)
                     }
-                    var response = try send(["operation": name, "session": sessionID, "arguments": arguments])
+                    var response = try send(["operation": name, "session": sessionID, "arguments": arguments], 40)
                     if let directory = downloadDirectory, response["ok"] as? Bool == true {
                         guard let path = response["download_path"] as? String, path.hasPrefix("/"), !path.contains("\0") else {
                             throw ChromeProfileConnection.Failure(message: "Chrome did not return an absolute completed download path.")

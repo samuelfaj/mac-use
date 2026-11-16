@@ -195,6 +195,16 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                   let mode = CGDisplayCopyDisplayMode(displays[0]), mode.width > 0 else { return 1 }
             return Double(mode.pixelWidth) / Double(mode.width)
         }
+        /// Image pixels per window point of the screenshot last given for this window, if it still fits.
+        var screenshotScale: (ComputerUseNativeHostTarget, CGRect) -> Double? = {
+            NativeSnapshotStore.shared.screenshotPixelsPerPoint(target: $0, windowSize: $1.size)
+        }
+        /// A Chromium-family window that other windows cover completely: its pages are hidden and take no input.
+        var hiddenChromium: (ComputerUseNativeHostTarget, CGRect) -> Bool = {
+            InputNative.isChromiumFamily(pid: $0.pid) && InputNative.windowFullyCovered(target: $0, bounds: $1)
+        }
+        /// Listens for the app's reaction so the result can say whether anything changed.
+        var settleWatcher: (ComputerUseNativeHostTarget) -> NativeSettleWatcher = { InputNative.settleWatcher(target: $0) }
         var post: (CGEvent, Int32, Bool) -> Void = { event, pid, foreground in
             if foreground { event.post(tap: .cghidEventTap) } else { BackgroundEventDelivery.post(event, pid: pid) }
         }
@@ -264,9 +274,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         case "click": return "Click an AX element or window-local screenshot pixel. Use action:pointer with element_id for explicit pointer delivery when AX reports success without a UI change. Background uses AX or pid-directed events without activation; foreground temporarily activates and restores prior app. Desktop scope uses screen points."
         case "double_click": return "Open an AX element with AXOpen when available, otherwise double-click its center or supplied window-local screenshot pixels."
         case "drag": return "Drag between window-local screenshot pixels with timed mouse events; background by default."
-        case "type_text": return "Insert selected text through AX, falling back to Unicode keyboard events. Desktop scope types into frontmost app."
-        case "press_key": return "Press a named key with optional modifiers using background pid events or temporary foreground delivery."
-        case "hotkey": return "Press one key with modifiers from keys, for example [cmd,c]."
+        case "type_text": return "Insert text through AX, falling back to keyboard events. A newline or tab in the text is sent as a real Return or Tab key press, so \"query\\n\" types and submits. Desktop scope types into frontmost app."
+        case "press_key": return "Press a named key with optional modifiers using background pid events or temporary foreground delivery. Pass element_id to give that element keyboard focus first."
+        case "hotkey": return "Press one key with modifiers from keys, for example [cmd,c]. Pass element_id to give that element keyboard focus first."
         case "move_cursor": return "Window scope reports an overlay position only, without moving real pointer. Desktop scope warps real pointer in screen points."
         case "get_cursor_position": return "Return real cursor position in screen points."
         case "invoke_menu": return "Walk app AX menu titles one level at a time, refusing missing, ambiguous or disabled items; press final item without activation."
@@ -290,6 +300,13 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         if desktop { properties["scope"] = ["type": "string", "enum": ["window", "desktop"], "default": "window"] }
         if mutationTools.contains(name) && name != "invoke_menu" && name != "move_cursor" {
             properties["delivery_mode"] = ["type": "string", "enum": ["background", "foreground"], "default": "background"]
+        }
+        if mutationTools.contains(name) { properties["allow_while_user_active"] = ChromeProfileComputerUseBackend.allowWhileUserActive }
+        if ["press_key", "hotkey"].contains(name) {
+            properties["element_id"] = ["type": "string", "description": "Give this element keyboard focus first; keys otherwise go to whatever holds focus."]
+        }
+        if ["click", "double_click", "type_text", "press_key", "hotkey"].contains(name) {
+            properties["expected_state_token"] = ["type": "string", "description": "Optional: the state_token of the get_ui_tree that element_id came from. Without it the id refers to the tree last returned for this window."]
         }
         switch name {
         case "click", "double_click":
@@ -330,7 +347,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
 
     public func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
         do {
-            let result = try await perform(name: name, arguments: arguments)
+            let result = try await NativeSnapshotStore.$actionToken.withValue(arguments["expected_state_token"] as? String) {
+                try await perform(name: name, arguments: arguments)
+            }
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
             return ComputerUseToolResult(text: String(decoding: data, as: UTF8.self))
         } catch { return ComputerUseToolResult(text: String(describing: error), isError: true) }
@@ -376,8 +395,11 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         }
         let window = windows.first { $0.target == target }
         guard desktop || window != nil else { throw InputToolsError("target window unavailable") }
+        let yieldsToUser = a["allow_while_user_active"] as? Bool != true
         func guardActivity() throws {
-            if effects.activity(target) == .human { throw InputToolsError("human_activity: target is in use") }
+            if yieldsToUser, effects.activity(target) == .human {
+                throw InputToolsError("human_activity: " + ChromeProfileComputerUseBackend.humanActivityHint)
+            }
         }
         try guardActivity()
         let foreground = desktop || a["delivery_mode"] as? String == "foreground"
@@ -403,7 +425,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             let py = (a[y] as! NSNumber).doubleValue
             if desktop { return CGPoint(x: px, y: py) }
             guard let window else { throw InputToolsError("target window unavailable") }
-            let scale = effects.scale(window.bounds)
+            // Pixels are read from the screenshot the caller was given, which is scaled down from
+            // the frame; with no screenshot on record they are taken as native frame pixels.
+            let scale = effects.screenshotScale(target, window.bounds) ?? effects.scale(window.bounds)
             guard scale.isFinite, scale > 0, px >= 0, py >= 0,
                   px < window.bounds.width * scale, py < window.bounds.height * scale else {
                 throw InputToolsError("coordinates outside window screenshot pixels")
@@ -411,9 +435,14 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             return CGPoint(x: window.bounds.minX + px / scale, y: window.bounds.minY + py / scale)
         }
         func post(_ event: CGEvent?) throws {
-            try guardActivity()
-            if foreground, effects.frontmost() != target.pid { throw InputToolsError("foreground application changed during delivery") }
             guard let event else { throw InputToolsError("CGEvent creation failed") }
+            // A gesture that has started is always finished: refusing between a down and its up
+            // would leave the key or the button held in the target.
+            let finishes = [.keyUp, .leftMouseUp, .rightMouseUp, .otherMouseUp, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged].contains(event.type)
+            if !finishes {
+                try guardActivity()
+                if foreground, effects.frontmost() != target.pid { throw InputToolsError("foreground application changed during delivery") }
+            }
             event.setIntegerValueField(.eventSourceUserData, value: ComputerUseNativeActivityMonitor.syntheticEventUserData)
             if !foreground && !desktop {
                 event.setIntegerValueField(CGEventField(rawValue: 40)!, value: Int64(target.pid))
@@ -429,18 +458,26 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                 let event = CGEvent(keyboardEventSource: nil, virtualKey: key.code, keyDown: down)
                 event?.flags = key.flags
                 try post(event)
+                // Apps sample key state; a down and its up in the same instant can read as no press.
+                if down { effects.sleep(0.008) }
             }
+        }
+        /// Keys go to whatever holds focus, which is rarely the field the caller means. Naming the
+        /// element puts focus there first (Return in an address bar that was only given a value did nothing).
+        func focusForKeys() throws {
+            guard let id = a["element_id"] as? String else { return }
+            try guardActivity()
+            guard effects.focusElement(target, id) else { throw InputToolsError("element unavailable or cannot take keyboard focus") }
         }
         func mouse(_ location: CGPoint, count: Int, button: String, flags: CGEventFlags) throws {
             let cgButton: CGMouseButton = button == "right" ? .right : (button == "middle" ? .center : .left)
             let down: CGEventType = button == "right" ? .rightMouseDown : (button == "middle" ? .otherMouseDown : .leftMouseDown)
             let up: CGEventType = button == "right" ? .rightMouseUp : (button == "middle" ? .otherMouseUp : .leftMouseUp)
-            if !foreground && !desktop {
-                let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: location, mouseButton: cgButton)
-                moved?.flags = flags
-                try post(moved)
-                effects.sleep(0.012)
-            }
+            // A press with no pointer move before it misses controls that arm on hover.
+            let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: location, mouseButton: cgButton)
+            moved?.flags = flags
+            try post(moved)
+            effects.sleep(foreground ? 0.04 : 0.012)
             let gesture = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fffffff)
             for index in 1...count {
                 for type in [down, up] {
@@ -450,91 +487,127 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                     event?.setIntegerValueField(CGEventField(rawValue: 58)!, value: gesture)
                     event?.setIntegerValueField(CGEventField(rawValue: 7)!, value: 0)
                     try post(event)
+                    if type == down { effects.sleep(foreground ? 0.028 : 0.001) }
                 }
                 if index < count { effects.sleep(0.04) }
             }
         }
-        switch name {
-        case "click", "double_click":
-            let id = a["element_id"] as? String
-            let actions = ["press": "AXPress", "show_menu": "AXShowMenu", "confirm": "AXConfirm", "cancel": "AXCancel", "open": "AXOpen", "pointer": ""]
-            if let id {
-                try guardActivity()
-                let action = name == "double_click" ? "AXOpen" : actions[a["action"] as? String ?? "press"]!
-                if !action.isEmpty && effects.axAction(target, id, action) { return ["ok": true, "delivery": "accessibility"] }
-                if !action.isEmpty && name != "double_click" { throw InputToolsError("AX action unavailable or failed: \(action)") }
-            }
-            let location: CGPoint
-            if let id {
-                guard let center = effects.elementPoint(target, id) else { throw InputToolsError("element bounds unavailable") }
-                location = center
-            } else { location = try point("x", "y") }
-            let count = name == "double_click" ? 2 : ((a["count"] as? NSNumber)?.intValue ?? 1)
-            let button = a["button"] as? String ?? "left"
-            let modifiers = try InputKey.modifiers(a["modifier"] as? [String] ?? [])
-            // Many apps ignore pid-directed mouse events; press the hit-tested AX control instead.
-            if !foreground, !desktop, id == nil, button == "left", modifiers.isEmpty, effects.axPressAt(target, location) {
-                for _ in 1..<count {
-                    effects.sleep(0.04)
-                    guard effects.axPressAt(target, location) else { throw InputToolsError("AX press failed on repeat") }
+        func act() throws -> [String: Any] {
+            switch name {
+            case "click", "double_click":
+                let id = a["element_id"] as? String
+                let actions = ["press": "AXPress", "show_menu": "AXShowMenu", "confirm": "AXConfirm", "cancel": "AXCancel", "open": "AXOpen", "pointer": ""]
+                if let id {
+                    try guardActivity()
+                    let action = name == "double_click" ? "AXOpen" : actions[a["action"] as? String ?? "press"]!
+                    if !action.isEmpty && effects.axAction(target, id, action) { return ["ok": true, "delivery": "accessibility"] }
+                    if !action.isEmpty && name != "double_click" { throw InputToolsError("AX action unavailable or failed: \(action)") }
                 }
-                return ["ok": true, "delivery": "accessibility"]
-            }
-            try mouse(location, count: count, button: button, flags: modifiers)
-        case "drag":
-            let start = try point("from_x", "from_y"), end = try point("to_x", "to_y")
-            let duration = ((a["duration_ms"] as? NSNumber)?.doubleValue ?? 500) / 1000
-            let steps = max(1, Int(ceil(duration * 60)))
-            try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left))
-            for step in 1...steps {
-                effects.sleep(duration / Double(steps))
-                let fraction = Double(step) / Double(steps)
-                try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: CGPoint(x: start.x + (end.x - start.x) * fraction, y: start.y + (end.y - start.y) * fraction), mouseButton: .left))
-            }
-            try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left))
-        case "type_text":
-            let text = a["text"] as! String
-            try guardActivity()
-            if try !desktop && (effects.insert(target, a["element_id"] as? String, text)) { return ["ok": true, "delivery": "accessibility"] }
-            if let id = a["element_id"] as? String {
-                try guardActivity()
-                guard effects.focusElement(target, id) else { throw InputToolsError("element unavailable or cannot receive keyboard fallback") }
-            }
-            let delay = ((a["delay_ms"] as? NSNumber)?.doubleValue ?? 0) / 1000
-            for character in text {
-                let units = Array(String(character).utf16)
-                for down in [true, false] {
-                    let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)
-                    units.withUnsafeBufferPointer { buffer in event?.keyboardSetUnicodeString(stringLength: units.count, unicodeString: buffer.baseAddress) }
-                    try post(event)
+                let location: CGPoint
+                if let id {
+                    guard let center = effects.elementPoint(target, id) else { throw InputToolsError("element bounds unavailable") }
+                    location = center
+                } else { location = try point("x", "y") }
+                let count = name == "double_click" ? 2 : ((a["count"] as? NSNumber)?.intValue ?? 1)
+                let button = a["button"] as? String ?? "left"
+                let modifiers = try InputKey.modifiers(a["modifier"] as? [String] ?? [])
+                // Many apps ignore pid-directed mouse events; press the hit-tested AX control instead.
+                if !foreground, !desktop, id == nil, button == "left", modifiers.isEmpty, effects.axPressAt(target, location) {
+                    for _ in 1..<count {
+                        effects.sleep(0.04)
+                        guard effects.axPressAt(target, location) else { throw InputToolsError("AX press failed on repeat") }
+                    }
+                    return ["ok": true, "delivery": "accessibility"]
                 }
-                if delay > 0 { effects.sleep(delay) }
-            }
-        case "press_key": try keyboard(InputKey.parse(a["key"] as! String, modifiers: a["modifiers"] as? [String] ?? []))
-        case "hotkey":
-            let keys = a["keys"] as! [String]
-            // pid-directed key events skip the menu bar, so background command chords press their menu item.
-            if !foreground, !desktop, let chord = ComputerUseNativeMenuChord.parse(keys.joined(separator: "+")), chord.command,
-               effects.menuShortcut(target, chord) {
-                return ["ok": true, "delivery": "accessibility"]
-            }
-            try keyboard(InputKey.hotkey(keys))
-        case "move_cursor":
-            let location = try point("x", "y")
-            if desktop {
+                try mouse(location, count: count, button: button, flags: modifiers)
+            case "drag":
+                let start = try point("from_x", "from_y"), end = try point("to_x", "to_y")
+                let duration = ((a["duration_ms"] as? NSNumber)?.doubleValue ?? 500) / 1000
+                let steps = max(1, Int(ceil(duration * 60)))
+                try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left))
+                for step in 1...steps {
+                    effects.sleep(duration / Double(steps))
+                    let fraction = Double(step) / Double(steps)
+                    try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: CGPoint(x: start.x + (end.x - start.x) * fraction, y: start.y + (end.y - start.y) * fraction), mouseButton: .left))
+                }
+                try post(CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left))
+            case "type_text":
+                let text = a["text"] as! String
                 try guardActivity()
-                guard effects.warp(location) else { throw InputToolsError("cursor warp failed") }
+                // Inserted through Accessibility, a newline is text in the field; only a key press submits.
+                let hasKeys = text.unicodeScalars.contains { $0 == "\n" || $0 == "\r" || $0 == "\t" }
+                if try !desktop && !hasKeys && (effects.insert(target, a["element_id"] as? String, text)) { return ["ok": true, "delivery": "accessibility"] }
+                if let id = a["element_id"] as? String {
+                    try guardActivity()
+                    guard effects.focusElement(target, id) else { throw InputToolsError("element unavailable or cannot receive keyboard fallback") }
+                }
+                let delay = ((a["delay_ms"] as? NSNumber)?.doubleValue ?? 0) / 1000
+                for character in text {
+                    // Return and Tab act on a field only as real keys; as text payload on key code 0
+                    // they are dropped (Chrome's address bar ignores them).
+                    if let code: CGKeyCode = ["\n": 36, "\r": 36, "\r\n": 36, "\t": 48][String(character)] {
+                        try keyboard(InputKey(code: code, flags: []))
+                    } else {
+                        let units = Array(String(character).utf16)
+                        for down in [true, false] {
+                            let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)
+                            units.withUnsafeBufferPointer { buffer in event?.keyboardSetUnicodeString(stringLength: units.count, unicodeString: buffer.baseAddress) }
+                            try post(event)
+                        }
+                    }
+                    if delay > 0 { effects.sleep(delay) }
+                }
+            case "press_key":
+                try focusForKeys()
+                try keyboard(InputKey.parse(a["key"] as! String, modifiers: a["modifiers"] as? [String] ?? []))
+            case "hotkey":
+                try focusForKeys()
+                let keys = a["keys"] as! [String]
+                // pid-directed key events skip the menu bar, so background command chords press their menu item.
+                if !foreground, !desktop, let chord = ComputerUseNativeMenuChord.parse(keys.joined(separator: "+")), chord.command,
+                   effects.menuShortcut(target, chord) {
+                    return ["ok": true, "delivery": "accessibility"]
+                }
+                try keyboard(InputKey.hotkey(keys))
+            case "move_cursor":
+                let location = try point("x", "y")
+                if desktop {
+                    try guardActivity()
+                    guard effects.warp(location) else { throw InputToolsError("cursor warp failed") }
+                }
+                return ["ok": true, "x": location.x, "y": location.y, "coordinate_space": "screen_points", "pointer_moved": desktop, "overlay_hint": !desktop]
+            case "invoke_menu": try effects.menu(target, a["path"] as! [String], guardActivity)
+            default: throw InputToolsError("unknown input tool: \(name)")
             }
-            return ["ok": true, "x": location.x, "y": location.y, "coordinate_space": "screen_points", "pointer_moved": desktop, "overlay_hint": !desktop]
-        case "invoke_menu": try effects.menu(target, a["path"] as! [String], guardActivity)
-        default: throw InputToolsError("unknown input tool: \(name)")
+            return ["ok": true, "delivery": foreground ? "foreground" : "background"]
         }
-        return ["ok": true, "delivery": foreground ? "foreground" : "background"]
+        // "ok" only means the input was accepted. Listen for the app's reaction and say what was seen.
+        let watcher = desktop || name == "move_cursor" ? nil : effects.settleWatcher(target)
+        defer { watcher?.cancel() }
+        var result = try act()
+        if !desktop, result["delivery"] as? String == "background", let window, effects.hiddenChromium(target, window.bounds) {
+            result["warning"] = "This window is completely covered by other windows. Chromium does not process input for a page it is not showing, so this probably had no effect: use the browser tools for web pages, or delivery_mode: \"foreground\"."
+        }
+        if let settle = watcher?.wait() {
+            result["effect"] = settle.effect
+            result["settle_ms"] = settle.elapsedMilliseconds
+        }
+        // A background action must leave the user's app in front. Pressing or focusing a control
+        // makes some apps bring themselves forward; when the target did that and the user did
+        // not go there themselves, hand the front back.
+        if !foreground, !desktop, let previous, previous != target.pid, effects.frontmost() == target.pid,
+           effects.activity(target) != .human {
+            result["took_focus"] = true
+            result["focus_returned"] = effects.activate(previous)
+        }
+        return result
     }
 
     static func validate(name: String, arguments a: [String: Any]) throws {
         guard let schema = inputSchema(for: name), let properties = schema["properties"] as? [String: Any] else { throw InputToolsError("unknown input tool: \(name)") }
-        for key in a.keys where properties[key] == nil { throw InputToolsError("unknown argument: \(key)") }
+        for key in a.keys where properties[key] == nil {
+            throw InputToolsError("unknown argument: \(key); accepted: \(properties.keys.sorted().joined(separator: ", "))")
+        }
         func string(_ key: String, required: Bool = false) throws {
             if let value = a[key] { guard value is String else { throw InputToolsError("\(key) must be a string") } }
             else if required { throw InputToolsError("\(key) required") }
@@ -549,7 +622,10 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
             guard let value = a[key] else { if required { throw InputToolsError("\(key) required") }; return }
             guard let items = value as? [String], items.allSatisfy({ !$0.isEmpty }) else { throw InputToolsError("\(key) must be strings") }
         }
-        for key in ["scope", "delivery_mode", "element_id", "button", "action", "text", "key"] where a[key] != nil { try string(key) }
+        for key in ["scope", "delivery_mode", "element_id", "button", "action", "text", "key", "expected_state_token"] where a[key] != nil { try string(key) }
+        if let allow = a["allow_while_user_active"] {
+            guard let flag = allow as? NSNumber, CFGetTypeID(flag) == CFBooleanGetTypeID() else { throw InputToolsError("allow_while_user_active must be a boolean") }
+        }
         if let scope = a["scope"] as? String, !["window", "desktop"].contains(scope) { throw InputToolsError("invalid scope") }
         if let mode = a["delivery_mode"] as? String, !["background", "foreground"].contains(mode) { throw InputToolsError("invalid delivery_mode") }
         let desktop = a["scope"] as? String == "desktop"

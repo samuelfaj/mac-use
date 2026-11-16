@@ -207,7 +207,159 @@ final class InputToolsTests: XCTestCase {
         effects.focusedWindow = { _ in true }
         effects.menuShortcut = { _, _ in false }
         effects.insert = { _, _, _ in false }
+        effects.settleWatcher = { _ in .immediate }
+        effects.hiddenChromium = { _, _ in false }
         return effects
+    }
+
+    func testTypedReturnAndTabAreKeyPressesNotText() async {
+        // A newline sent as text on key code 0 is not a key press: Chrome's address bar and
+        // single-line fields ignored it, so "type the URL and press Return" never submitted.
+        var effects = fakeEffects()
+        var codes: [Int64] = []
+        effects.post = { event, _, _ in if event.type == .keyDown { codes.append(event.getIntegerValueField(.keyboardEventKeycode)) } }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "type_text", arguments: arguments(["text": "a\nb\t"]))
+        XCTAssertFalse(result.isError, result.content.first?.text ?? "")
+        XCTAssertEqual(codes, [0, 36, 0, 48])
+    }
+
+    func testAGestureThatStartedIsFinishedEvenIfTheUserArrives() async {
+        // The activity check used to run before every event. Tripping between a key down and
+        // its up left the key held in the target app, which is worse than either outcome.
+        var effects = fakeEffects()
+        var posted: [CGEventType] = []
+        var userArrived = false
+        effects.activity = { _ in userArrived ? .human : .none }
+        effects.post = { event, _, _ in posted.append(event.type); userArrived = true }
+        let backend = InputToolsBackend(effects: effects)
+        let first = await backend.invoke(name: "press_key", arguments: arguments(["key": "return"]))
+        XCTAssertFalse(first.isError, first.content.first?.text ?? "")
+        XCTAssertEqual(posted, [.keyDown, .keyUp])
+        // A new gesture still yields to the user.
+        let second = await backend.invoke(name: "press_key", arguments: arguments(["key": "return"]))
+        XCTAssertTrue(second.isError)
+        XCTAssertEqual(posted.count, 2)
+    }
+
+    func testResultSaysWhetherTheAppReacted() async throws {
+        // A click that did nothing used to come back as plain "ok", and the agent built on it.
+        // Silence is reported as unverified, never as "nothing happened": a real page toggled
+        // while its app sent no notification, and a false no-op would invite toggling it back.
+        for (reacted, expected) in [(true, "ui_changed"), (false, "unverified"), (nil, "unverified")] as [(Bool?, String)] {
+            var effects = fakeEffects()
+            effects.axAction = { _, _, _ in true }
+            effects.settleWatcher = { _ in NativeSettleWatcher(wait: { .init(settled: true, elapsedMilliseconds: 7, reacted: reacted) }) }
+            let result = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1"]))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(result.content.first?.text).utf8)) as? [String: Any])
+            XCTAssertEqual(object["effect"] as? String, expected)
+            XCTAssertEqual(object["delivery"] as? String, "accessibility")
+        }
+        // The watcher only reports a reaction it actually saw.
+        var answers = [true, false]
+        XCTAssertEqual(NativeSettle.wait(now: { 0 }, waitForNotification: { _ in answers.removeFirst() }).reacted, true)
+        XCTAssertEqual(NativeSettle.wait(now: { 0 }, waitForNotification: { _ in false }).reacted, false)
+    }
+
+    func testATargetThatBringsItselfForwardGivesTheFrontBack() async throws {
+        // Background delivery promises the user's app stays in front. Pressing a control made a
+        // browser activate itself over what the user was doing; the front is handed back, unless
+        // the user is the one who went there.
+        func run(userWentThere: Bool) async throws -> (result: [String: Any], activated: [Int32]) {
+            var effects = fakeEffects()
+            var front: Int32 = 99
+            var activated: [Int32] = []
+            var acted = false
+            effects.frontmost = { front }
+            effects.axAction = { target, _, _ in front = target.pid; acted = true; return true }
+            effects.activity = { _ in acted && userWentThere ? .human : .none }
+            effects.activate = { activated.append($0); front = $0; return true }
+            let result = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1"]))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(result.content.first?.text).utf8)) as? [String: Any])
+            return (object, activated)
+        }
+        let stolen = try await run(userWentThere: false)
+        XCTAssertEqual(stolen.result["took_focus"] as? Bool, true)
+        XCTAssertEqual(stolen.result["focus_returned"] as? Bool, true)
+        XCTAssertEqual(stolen.activated, [99])
+        let chosen = try await run(userWentThere: true)
+        XCTAssertNil(chosen.result["took_focus"])
+        XCTAssertEqual(chosen.activated, [], "an app the user switched to must not be taken away from them")
+    }
+
+    func testKeysGoToTheNamedElementNotToWhateverHoldsFocus() async {
+        // Return pressed after an address bar was only given a value went to the page instead:
+        // setting a value through Accessibility does not move keyboard focus.
+        var effects = fakeEffects()
+        var order: [String] = []
+        effects.focusElement = { _, id in order.append("focus:\(id)"); return id == "ax_10" }
+        effects.post = { event, _, _ in if event.type == .keyDown { order.append("key:\(event.getIntegerValueField(.keyboardEventKeycode))") } }
+        let backend = InputToolsBackend(effects: effects)
+        let pressed = await backend.invoke(name: "press_key", arguments: arguments(["key": "return", "element_id": "ax_10"]))
+        XCTAssertFalse(pressed.isError, pressed.content.first?.text ?? "")
+        XCTAssertEqual(order, ["focus:ax_10", "key:36"])
+        // An element that cannot take focus is reported; the key is not sent somewhere else instead.
+        let refused = await backend.invoke(name: "hotkey", arguments: arguments(["keys": ["cmd", "a"], "element_id": "ax_11"]))
+        XCTAssertTrue(refused.isError)
+        XCTAssertEqual(order, ["focus:ax_10", "key:36", "focus:ax_11"])
+    }
+
+    func testTextThatEndsInReturnIsTypedSoTheReturnSubmits() async {
+        // Inserted through Accessibility, "url\n" became a field holding a newline and nothing was submitted.
+        var effects = fakeEffects()
+        var codes: [Int64] = []
+        effects.insert = { _, _, _ in XCTFail("a text with Return must not be inserted as a value"); return true }
+        effects.focusElement = { _, _ in true }
+        effects.post = { event, _, _ in if event.type == .keyDown { codes.append(event.getIntegerValueField(.keyboardEventKeycode)) } }
+        let result = await InputToolsBackend(effects: effects).invoke(name: "type_text", arguments: arguments(["text": "go\r\n", "element_id": "ax_10"]))
+        XCTAssertFalse(result.isError, result.content.first?.text ?? "")
+        XCTAssertEqual(codes, [0, 0, 36])
+    }
+
+    func testACoveredChromiumWindowIsCalledOutInsteadOfReportedAsDelivered() async throws {
+        // Measured on a real window: the same background click toggled a page while the window
+        // was visible and did nothing once another window covered it, with the same "ok".
+        var effects = fakeEffects()
+        effects.hiddenChromium = { _, _ in true }
+        let covered = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["x": 10, "y": 10]))
+        let warned = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(covered.content.first?.text).utf8)) as? [String: Any])
+        XCTAssertTrue((warned["warning"] as? String)?.contains("browser tools") == true)
+        // Accessibility actions do not depend on the page being shown.
+        effects.axAction = { _, _, _ in true }
+        let pressed = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["element_id": "ax_1"]))
+        let quiet = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(pressed.content.first?.text).utf8)) as? [String: Any])
+        XCTAssertNil(quiet["warning"])
+
+        typealias Platform = ComputerUseNativeHostBackend.NativePlatform
+        let frame = CGRect(x: 40, y: 60, width: 900, height: 700)
+        XCTAssertTrue(Platform.covered(target: 5, bounds: frame, frontToBack: [(1, CGRect(x: 0, y: 30, width: 1668, height: 1265)), (5, frame)]))
+        XCTAssertFalse(Platform.covered(target: 5, bounds: frame, frontToBack: [(1, CGRect(x: 100, y: 100, width: 400, height: 400)), (5, frame)]))
+        XCTAssertFalse(Platform.covered(target: 5, bounds: frame, frontToBack: [(5, frame), (1, CGRect(x: 0, y: 0, width: 3000, height: 3000))]), "a window behind it hides nothing")
+    }
+
+    func testClickPixelsFollowTheScreenshotTheCallerWasGiven() async {
+        // click takes pixels of the screenshot. That image is scaled down from the frame, so
+        // dividing by the display scale sent clicks to the wrong point; with no screenshot on
+        // record the pixels are still read as frame pixels, as before.
+        var effects = fakeEffects()
+        var pressed: [CGPoint] = []
+        effects.axPressAt = { _, point in pressed.append(point); return true }
+        effects.screenshotScale = { _, bounds in bounds.width == 300 ? 0.5 : nil }
+        _ = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["x": 75, "y": 50]))
+        XCTAssertEqual(pressed.last, CGPoint(x: 100 + 150, y: 200 + 100))
+        let outside = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["x": 151, "y": 50]))
+        XCTAssertTrue(outside.isError, "151 is past the 150-pixel image of a 300-point window")
+        effects.screenshotScale = { _, _ in nil }
+        _ = await InputToolsBackend(effects: effects).invoke(name: "click", arguments: arguments(["x": 75, "y": 50]))
+        XCTAssertEqual(pressed.last, CGPoint(x: 100 + 37.5, y: 200 + 25))
+    }
+
+    func testUnknownArgumentNamesTheOnesThatAreAccepted() async {
+        // "unknown argument: width" left the caller guessing; a screenshot width was the real case.
+        let result = await InputToolsBackend(effects: fakeEffects()).invoke(name: "click", arguments: arguments(["x": 1, "y": 1, "width": 900]))
+        XCTAssertTrue(result.isError)
+        let text = result.content.first?.text ?? ""
+        XCTAssertTrue(text.contains("unknown argument: width"), text)
+        XCTAssertTrue(text.contains("accepted:") && text.contains("delivery_mode") && text.contains("expected_state_token"), text)
     }
 
     func testBackgroundPixelClickUsesAXPressWhenAvailable() async {
@@ -299,6 +451,26 @@ final class InputToolsTests: XCTestCase {
         }
     }
 
+    func testEscalationActsWhileTheUserIsOnTheTargetAndTheRefusalSaysHow() async throws {
+        // Stealth is the default, but a refusal must not be a dead end: when no quiet route
+        // exists the caller retries the same call with allow_while_user_active.
+        var effects = fakeEffects()
+        effects.activity = { _ in .human }
+        var pressed = 0
+        effects.axAction = { _, _, _ in pressed += 1; return true }
+        let backend = InputToolsBackend(effects: effects)
+        let refused = await backend.invoke(name: "click", arguments: arguments(["element_id": "ax_1"]))
+        XCTAssertTrue(refused.isError)
+        XCTAssertTrue(try XCTUnwrap(refused.content.first?.text).contains("allow_while_user_active"))
+        XCTAssertEqual(pressed, 0)
+        let allowed = await backend.invoke(name: "click", arguments: arguments(["element_id": "ax_1", "allow_while_user_active": true]))
+        XCTAssertFalse(allowed.isError, allowed.content.first?.text ?? "")
+        XCTAssertEqual(pressed, 1)
+        let invalid = await backend.invoke(name: "click", arguments: arguments(["element_id": "ax_1", "allow_while_user_active": "yes"]))
+        XCTAssertTrue(invalid.isError)
+        XCTAssertEqual(pressed, 1)
+    }
+
     func testForegroundSucceedsWhenRaiseFailsIfActivationMakesTargetFrontmost() async {
         var effects = fakeEffects()
         var frontmost: Int32 = 99
@@ -313,19 +485,20 @@ final class InputToolsTests: XCTestCase {
         let backend = InputToolsBackend(effects: effects)
         let result = await backend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
         XCTAssertFalse(result.isError)
-        XCTAssertEqual(events.count, 2)
+        // A pointer move comes first: a press with none before it misses controls that arm on hover.
+        XCTAssertEqual(events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
 
         effects.focusedWindow = { _ in false }
         let otherWindowBackend = InputToolsBackend(effects: effects)
         let otherWindow = await otherWindowBackend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
         XCTAssertTrue(otherWindow.isError, "keys must never reach a sibling window of the same app")
-        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.count, 3)
 
         effects.activate = { _ in false }
         let failingBackend = InputToolsBackend(effects: effects)
         let failed = await failingBackend.invoke(name: "click", arguments: arguments(["x": 10, "y": 10, "delivery_mode": "foreground"]))
         XCTAssertTrue(failed.isError)
-        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.count, 3)
     }
 
     func testForegroundRestoresPriorAppAndWindowMoveDoesNotWarp() async {

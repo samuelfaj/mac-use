@@ -132,7 +132,7 @@ globalThis.chrome = {
   }},
 };
 
-const {handleRequest, pageOperation, resolveTarget, settleBegin, settlePoll, settle} = await import('../chrome-extension/background.js');
+const {handleRequest, runRequest, pageOperation, resolveTarget, settleBegin, settlePoll, settle, extensionVersion} = await import('../chrome-extension/background.js');
 
 test('browser_act rejects a reused element whose label changes after its snapshot', () => {
   let label = 'Save';
@@ -182,11 +182,20 @@ test('browser_act rejects a reused element whose label changes after its snapsho
   }
 });
 
-test('a newly selected tab cannot be read or mutated during the script race', () => {
-  globalThis.document = {visibilityState: 'visible'};
-  assert.throws(() => pageOperation('browser_snapshot', {}), /human_activity/);
-  assert.throws(() => pageOperation('browser_act', {action: 'click', ref: 'any'}), /human_activity/);
-  delete globalThis.document;
+test('a page that reports visible can still be read', () => {
+  // Focus emulation makes the owned background tab report "visible", so the page cannot be the
+  // one to decide whether the user is looking; the service worker checks tab selection instead.
+  const previous = {document: globalThis.document, location: globalThis.location, snapshot: globalThis.__macUseSnapshot};
+  try {
+    globalThis.document = {visibilityState: 'visible', readyState: 'complete', title: 'test', body: {innerText: 'page text'}, querySelectorAll() { return []; }};
+    globalThis.location = {href: 'https://example.test/'};
+    assert.equal(pageOperation('browser_snapshot', {}).text, 'page text');
+  } finally {
+    for (const [key, value] of Object.entries({document: previous.document, location: previous.location, __macUseSnapshot: previous.snapshot})) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
+  }
 });
 
 async function openSession(id) {
@@ -522,15 +531,11 @@ test('navigate refuses unsafe schemes and returns fresh page for allowed navigat
   await handleRequest({operation: 'browser_close', session});
 });
 
-test('trusted click and typing dispatch debugger input and detach after calls', async () => {
+test('trusted click and typing dispatch debugger input and keep the tab awake', async () => {
   const {session, tabId} = await openSession(102);
   debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_click', session, arguments: {x: 31, y: 42, button: 'right', click_count: 2}});
   const mouseCalls = debuggerCalls.filter(c => c.method === 'Input.dispatchMouseEvent');
-  const mouseFirst = debuggerCalls.indexOf(mouseCalls[0]);
-  const mouseLast = debuggerCalls.indexOf(mouseCalls.at(-1));
-  assert.deepEqual(debuggerCalls.slice(0, mouseFirst).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: true}]);
-  assert.deepEqual(debuggerCalls.slice(mouseLast + 1).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: false}]);
   assert.deepEqual(mouseCalls.map(c => c.params), [
     {type: 'mouseMoved', x: 31, y: 42},
     {type: 'mousePressed', x: 31, y: 42, button: 'right', clickCount: 1},
@@ -539,52 +544,46 @@ test('trusted click and typing dispatch debugger input and detach after calls', 
     {type: 'mousePressed', x: 31, y: 42, button: 'right', clickCount: 2},
     {type: 'mouseReleased', x: 31, y: 42, button: 'right', clickCount: 2},
   ]);
-  assert.equal(attachedTabs.has(tabId), false);
   await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 1, y: 2, button: 'bad'}}), /Invalid button/);
   debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_type', session, arguments: {ref: 'ref', text: 'hello', mode: 'insert_text'}});
   assert.deepEqual(debuggerCalls.find(c => c.method === 'Input.insertText').params, {text: 'hello'});
-  assert.equal(debuggerCalls.some(c => c.method === 'Emulation.setFocusEmulationEnabled' && c.params.enabled === true), false);
   debuggerCalls.length = 0;
   await handleRequest({operation: 'browser_type', session, arguments: {text: 'a😀', mode: 'keystrokes'}});
-  const keyCalls = debuggerCalls.filter(c => c.method === 'Input.dispatchKeyEvent');
-  const keyFirst = debuggerCalls.indexOf(keyCalls[0]);
-  const keyLast = debuggerCalls.indexOf(keyCalls.at(-1));
-  assert.deepEqual(debuggerCalls.slice(0, keyFirst).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: true}]);
-  assert.deepEqual(debuggerCalls.slice(keyLast + 1).filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params), [{enabled: false}]);
-  assert.deepEqual(keyCalls.map(c => c.params), [
+  assert.deepEqual(debuggerCalls.filter(c => c.method === 'Input.dispatchKeyEvent').map(c => c.params), [
     {type: 'keyDown', key: 'a', text: 'a'}, {type: 'keyUp', key: 'a'},
     {type: 'keyDown', key: '😀', text: '😀'}, {type: 'keyUp', key: '😀'},
   ]);
-  assert.equal(attachedTabs.has(tabId), false);
+  // Turning emulation off around input would hide the tab again and stop it rendering.
+  assert.equal(debuggerCalls.some(c => c.method === 'Emulation.setFocusEmulationEnabled'), false);
+  assert.equal(attachedTabs.has(tabId), true);
   await handleRequest({operation: 'browser_close', session});
+  assert.equal(attachedTabs.has(tabId), false);
 });
-test('dropped trusted input errors and detaches debugger', async () => {
-  const {session, tabId} = await openSession(103);
+test('dropped trusted input is reported instead of passing as a click', async () => {
+  const {session} = await openSession(103);
   const original = chrome.scripting.executeScript;
   chrome.scripting.executeScript = async ({func, ...options}) => func.toString().includes('__macUseInputSeen') ? [{result: 0}] : original({func, ...options});
   try {
-    await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 31, y: 42}}), /trusted_input_not_delivered: Chrome dropped trusted input to this background tab/);
-    assert.equal(attachedTabs.has(tabId), false);
+    await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 31, y: 42}}), /trusted_input_not_delivered/);
   } finally {
     chrome.scripting.executeScript = original;
     await handleRequest({operation: 'browser_close', session});
   }
 });
 
-test('dialog listener retains debugger until accept or dismiss', async () => {
+test('a dialog opened by a click is reported and handled through browser_dialog', async () => {
   const {session, tabId} = await openSession(103);
   for (const action of ['accept', 'dismiss']) {
     dialogOnClick = true;
     const clicked = await handleRequest({operation: 'browser_click', session, arguments: {x: 10, y: 20}});
     dialogOnClick = false;
     assert.equal(clicked.dialog.type, 'prompt');
-    assert.equal(attachedTabs.has(tabId), true);
     const inspected = await handleRequest({operation: 'browser_dialog', session, arguments: {action: 'inspect'}});
     assert.equal(inspected.dialog.message, 'Name?');
     await handleRequest({operation: 'browser_dialog', session, arguments: {action, prompt_text: 'Ada'}});
     assert.deepEqual(debuggerCalls.filter(c => c.method === 'Page.handleJavaScriptDialog').at(-1).params, {accept: action === 'accept', promptText: 'Ada'});
-    assert.equal(attachedTabs.has(tabId), false);
+    assert.equal((await handleRequest({operation: 'browser_dialog', session, arguments: {action: 'inspect'}})).dialog, null);
   }
   await handleRequest({operation: 'browser_close', session});
 });
@@ -657,4 +656,197 @@ test('trusted input ref resolution refuses changed elements and coordinates outs
       assert.throws(() => resolveTarget(args), /finite viewport/);
     }
   });
+});
+
+test('an owned background tab is kept rendering from browser_open until browser_close', async () => {
+  // A hidden tab renders no frames (dialogs never appear) and Chrome freezes tabs in a collapsed
+  // group (page scripts never return). Toggling emulation per call left both gaps open.
+  debuggerCalls.length = 0;
+  const {session, tabId} = await openSession(30);
+  const emulation = () => debuggerCalls.filter(c => c.method === 'Emulation.setFocusEmulationEnabled').map(c => c.params);
+  assert.equal(attachedTabs.has(tabId), true);
+  assert.deepEqual(emulation(), [{enabled: true}]);
+  await handleRequest({operation: 'browser_snapshot', session});
+  await handleRequest({operation: 'browser_act', session, arguments: {action: 'scroll'}});
+  await handleRequest({operation: 'browser_click', session, arguments: {x: 3, y: 4}});
+  assert.equal(attachedTabs.has(tabId), true);
+  assert.deepEqual(emulation(), [{enabled: true}]);
+  await handleRequest({operation: 'browser_close', session});
+  assert.equal(attachedTabs.has(tabId), false);
+});
+
+test('a debugger that cannot attach does not block plain snapshots', async () => {
+  // Reading the page needs only script injection; the request deadline still bounds a frozen tab.
+  const attach = chrome.debugger.attach;
+  chrome.debugger.attach = async () => { throw new Error('Cannot attach to this target.'); };
+  try {
+    const {session} = await openSession(34);
+    assert.equal((await handleRequest({operation: 'browser_snapshot', session})).url, 'https://example.com/');
+    await handleRequest({operation: 'browser_close', session});
+  } finally { chrome.debugger.attach = attach; }
+});
+
+test('a tab the user selected is acted on only when the caller escalates', async () => {
+  // Stealth is the default: selection yields the tab. Escalation is explicit and lasts one call.
+  const {session, tabId} = await openSession(31);
+  activeTabId = tabId;
+  activated.fire({tabId});
+  try {
+    await assert.rejects(handleRequest({operation: 'browser_snapshot', session}), /human_activity.*allow_while_user_active/);
+    await assert.rejects(handleRequest({operation: 'browser_click', session, arguments: {x: 1, y: 2}}), /human_activity/);
+    const snapshot = await handleRequest({operation: 'browser_snapshot', session, arguments: {allow_while_user_active: true}});
+    assert.equal(snapshot.url, 'https://example.com/');
+    debuggerCalls.length = 0;
+    await handleRequest({operation: 'browser_click', session, arguments: {x: 1, y: 2, allow_while_user_active: true}});
+    assert.equal(debuggerCalls.filter(c => c.method === 'Input.dispatchMouseEvent').length, 3);
+    await assert.rejects(handleRequest({operation: 'browser_snapshot', session, arguments: {allow_while_user_active: 'yes'}}), /must be a boolean/);
+    await assert.rejects(handleRequest({operation: 'browser_act', session, arguments: {action: 'scroll'}}), /human_activity/);
+    assert.deepEqual(await handleRequest({operation: 'browser_close', session}), {closed: false, released: true});
+    assert.equal(tabs.has(tabId), true);
+  } finally {
+    activeTabId = undefined;
+    tabs.delete(tabId);
+  }
+});
+
+test('a page that never answers ends its request and leaves the queue serving', async () => {
+  // In production Chrome froze the tab, executeScript never returned, and every later request
+  // from every client timed out for eight hours behind it.
+  const {session, tabId} = await openSession(32);
+  const original = chrome.scripting.executeScript;
+  chrome.scripting.executeScript = () => new Promise(() => {});
+  try {
+    await assert.rejects(runRequest({operation: 'browser_snapshot', session}, 20), /tab_unresponsive/);
+  } finally { chrome.scripting.executeScript = original; }
+  // The tab is closed because an injected script may already be queued in it.
+  assert.equal(removedTabIds.includes(tabId), true);
+  assert.deepEqual(await runRequest({operation: 'browser_status', session}, 20), {connected: true, mode: 'current_chrome_profile', hasTab: false, version: extensionVersion});
+});
+
+test('a request abandoned at its deadline cannot act when the page wakes up', async () => {
+  // The user took the tab over while the page was frozen, so it could not be closed; the click
+  // that was still waiting must not land on what they are doing now.
+  const {session, tabId} = await openSession(33);
+  const original = chrome.scripting.executeScript;
+  let injections = 0;
+  let wake;
+  let started;
+  const injected = new Promise(resolve => { started = resolve; });
+  chrome.scripting.executeScript = () => {
+    injections++;
+    started();
+    return new Promise(resolve => { wake = () => resolve([{result: undefined}]); });
+  };
+  try {
+    const pending = runRequest({operation: 'browser_act', session, arguments: {action: 'click', ref: 'ref'}}, 20);
+    await injected;
+    activeTabId = tabId;
+    activated.fire({tabId});
+    await assert.rejects(pending, /tab_unresponsive/);
+    assert.equal(tabs.has(tabId), true);
+    wake();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(injections, 1);
+  } finally {
+    chrome.scripting.executeScript = original;
+    activeTabId = undefined;
+    tabs.delete(tabId);
+  }
+});
+
+test('a styled switch is reachable through the label that hides its checkbox', () => {
+  // Slack-style switches draw a label and shrink the real checkbox to nothing, so the control
+  // the task needs was missing from every snapshot.
+  let clicks = 0;
+  const label = fakeElement('LABEL', {innerText: 'Activate Incoming Webhooks'});
+  const hidden = {getBoundingClientRect: () => ({left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0})};
+  const checkbox = fakeElement('INPUT', {type: 'checkbox', value: 'on', labels: [label], click() { clicks++; }, ...hidden});
+  const orphan = fakeElement('INPUT', {type: 'checkbox', ...hidden});
+  const textField = fakeElement('INPUT', {type: 'text', labels: [label], ...hidden});
+  withPage([checkbox, orphan, textField], {top: () => label}, () => {
+    const {elements} = pageOperation('browser_snapshot', {});
+    assert.deepEqual(elements.map(item => item.name), ['Activate Incoming Webhooks']);
+    assert.equal(elements[0].covered, undefined);
+    pageOperation('browser_act', {action: 'click', ref: elements[0].ref});
+    assert.equal(clicks, 1);
+  });
+});
+
+test('a page blocked by a JavaScript dialog reports the dialog and keeps its tab', async () => {
+  // prompt() and confirm() stop every script in the page until they are answered, so the call
+  // that opened one never returned and took the whole bridge down with it.
+  const {session, tabId} = await openSession(35);
+  const original = chrome.scripting.executeScript;
+  let injections = 0;
+  chrome.scripting.executeScript = () => {
+    injections++;
+    debuggerEvent.fire({tabId}, 'Page.javascriptDialogOpening', {type: 'confirm', message: 'Delete this app?'});
+    return new Promise(() => {});
+  };
+  try {
+    const opened = await runRequest({operation: 'browser_act', session, arguments: {action: 'click', ref: 'ref'}}, 2000, 10);
+    assert.equal(opened.dialog.message, 'Delete this app?');
+    assert.equal(tabs.has(tabId), true);
+    // Nothing else is sent to a page that cannot answer; the dialog is reported straight away.
+    const again = await runRequest({operation: 'browser_snapshot', session}, 2000, 10);
+    assert.equal(again.dialog.message, 'Delete this app?');
+    assert.equal(injections, 1);
+  } finally { chrome.scripting.executeScript = original; }
+  debuggerCalls.length = 0;
+  await runRequest({operation: 'browser_dialog', session, arguments: {action: 'accept'}}, 2000, 10);
+  // Only the browser can answer while the page is blocked; a page-side command would hang.
+  assert.deepEqual(debuggerCalls.map(c => c.method).filter(m => !m.startsWith('Runtime.evaluate')), ['Page.handleJavaScriptDialog']);
+  assert.equal((await runRequest({operation: 'browser_snapshot', session}, 2000, 10)).url, 'https://example.com/');
+  await handleRequest({operation: 'browser_close', session});
+});
+
+test('a hung disconnect cleanup does not hold the queue', async () => {
+  // Cleanup runs on the same queue as requests; it is bounded like them.
+  const {session, tabId} = await openSession(36);
+  const remove = chrome.tabs.remove;
+  chrome.tabs.remove = () => new Promise(() => {});
+  const timeouts = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => { timeouts.push(ms); return realSetTimeout(fn, ms === 5000 ? 5 : ms, ...rest); };
+  try {
+    await assert.rejects(runRequest({operation: 'browser_snapshot', session, arguments: {allow_while_user_active: 1}}, 20), /must be a boolean/);
+    const original = chrome.scripting.executeScript;
+    chrome.scripting.executeScript = () => new Promise(() => {});
+    try { await assert.rejects(runRequest({operation: 'browser_snapshot', session}, 20), /tab_unresponsive/); }
+    finally { chrome.scripting.executeScript = original; }
+    assert.equal(timeouts.includes(5000), true);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    chrome.tabs.remove = remove;
+    tabs.delete(tabId);
+  }
+});
+
+test('a snapshot query returns the matching controls, even past the element cap, without the page text', () => {
+  // A long admin page lists hundreds of links before the one button the task needs, and its
+  // text is most of the snapshot. Asking for the control must find it and leave the rest out.
+  const filler = Array.from({length: 230}, (_, index) => fakeElement('A', {innerText: `Row ${index}`}));
+  const remove = fakeElement('BUTTON', {innerText: 'Delete App'});
+  withPage([...filler, remove], {}, () => {
+    globalThis.document.body.innerText = 'x'.repeat(5000);
+    const all = pageOperation('browser_snapshot', {});
+    assert.equal(all.elements.some(item => item.name === 'Delete App'), false);
+    assert.equal(all.text.length, 5000);
+    const found = pageOperation('browser_snapshot', {query: 'delete app | nothing'});
+    assert.deepEqual(found.elements.map(item => item.name), ['Delete App']);
+    assert.equal(found.text, undefined);
+    let clicks = 0;
+    remove.click = () => { clicks++; };
+    pageOperation('browser_act', {action: 'click', ref: found.elements[0].ref});
+    assert.equal(clicks, 1);
+  });
+});
+
+test('the version the code reports is the one in the manifest', async () => {
+  // The server decides from this value whether Chrome is running a copy too old to trust. It is
+  // a constant in the code because a re-enabled extension keeps its old manifest; the two must
+  // still be bumped together or a fresh install would report the wrong thing.
+  const {readFile} = await import('node:fs/promises');
+  const manifest = JSON.parse(await readFile(new URL('../chrome-extension/manifest.json', import.meta.url), 'utf8'));
+  assert.equal(extensionVersion, manifest.version);
 });

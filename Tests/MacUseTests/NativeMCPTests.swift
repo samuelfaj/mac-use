@@ -200,8 +200,79 @@ final class NativeMCPTests: XCTestCase {
         let instructions = try XCTUnwrap(result["instructions"] as? String)
         XCTAssertTrue(instructions.contains("state token"))
         XCTAssertTrue(instructions.contains("browser_open"))
+        // The loop an agent follows, in order, short enough to be read: status before web work,
+        // a narrow read, acting by element, reading the effect, and the escalation rule.
+        for step in ["browser_status", "get_ui_tree", "element_id", "effect", "allow_while_user_active", "said not to interrupt"] {
+            XCTAssertTrue(instructions.contains(step), step)
+        }
+        XCTAssertLessThan(instructions.count, 2600)
         let notificationReply = await handler.handle(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
         XCTAssertNil(notificationReply)
+    }
+
+    private func call(_ handler: ManagedComputerUseMCP, _ name: String, _ arguments: [String: Any]) async throws -> (text: String, isError: Bool) {
+        let request: [String: Any] = ["jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["name": name, "arguments": arguments]]
+        let line = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+        let message = try await response(line, from: handler)
+        let result = try XCTUnwrap(message["result"] as? [String: Any])
+        let parts = try XCTUnwrap(result["content"] as? [[String: Any]])
+        return (parts.compactMap { $0["text"] as? String }.joined(separator: "\n"), result["isError"] as? Bool ?? false)
+    }
+
+    private func passthroughHandler() -> ManagedComputerUseMCP {
+        let lock = FileManager.default.temporaryDirectory.appendingPathComponent("mac-use-tests-\(UUID().uuidString)/computer-use.lock")
+        return ManagedComputerUseMCP(queue: ComputerUseHostQueue(lockURL: lock), backend: ComputerUseQueuedPassthroughBackend())
+    }
+
+    func testAnArgumentTheToolDoesNotTakeIsRefusedWithTheOnesItDoes() async throws {
+        // The agent asked screenshot for width: 900. It was dropped in silence, the image came
+        // back at Retina size, and every click computed from the expected size missed.
+        let handler = passthroughHandler()
+        let refused = try await call(handler, "screenshot", ["target_pid": 42, "target_window_id": 7, "width": 900])
+        XCTAssertTrue(refused.isError)
+        XCTAssertTrue(refused.text.contains("unknown argument: width"), refused.text)
+        XCTAssertTrue(refused.text.contains("max_image_dimension"), refused.text)
+        let accepted = try await call(handler, "screenshot", ["target_pid": 42, "target_window_id": 7, "max_image_dimension": 900, "session": "s"])
+        XCTAssertFalse(accepted.isError, accepted.text)
+    }
+
+    func testEarlierToolNamesStillRunThoughTheyAreNotListed() async throws {
+        // Recorded trajectories and older prompts call them; hiding must not break those.
+        let handler = passthroughHandler()
+        let legacy = try await call(handler, "left_click", ["target_pid": 42, "target_window_id": 7, "expected_state_token": "t", "coordinate": [1, 2]])
+        XCTAssertFalse(legacy.isError, legacy.text)
+        XCTAssertTrue(legacy.text.contains("queued left_click"))
+    }
+
+    func testRunStepsStopsAtTheFirstFailureAndReadsOnce() async throws {
+        // Acting and re-reading used to be two round trips with the window free to change between them.
+        let handler = passthroughHandler()
+        let done = try await call(handler, "run_steps", [
+            "steps": [["tool": "click_element", "arguments": ["target_pid": 42, "target_window_id": 7, "expected_state_token": "t", "element_id": "ax_1"]],
+                      ["tool": "set_value", "arguments": ["target_pid": 42, "target_window_id": 7, "expected_state_token": "t", "element_id": "ax_2", "value": "x"]]],
+            "observe": ["target_pid": 42, "target_window_id": 7, "query": "save"],
+        ])
+        XCTAssertFalse(done.isError, done.text)
+        let output = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(done.text.utf8)) as? [String: Any])
+        XCTAssertEqual(output["completed"] as? Int, 2)
+        XCTAssertEqual((output["results"] as? [[String: Any]])?.map { $0["tool"] as? String }, ["click_element", "set_value"])
+        XCTAssertTrue((output["observation"] as? String)?.contains("queued get_ui_tree") == true)
+
+        let stopped = try await call(handler, "run_steps", [
+            "steps": [["tool": "click_element", "arguments": ["target_pid": 42, "target_window_id": 7, "expected_state_token": "t", "element_id": "ax_1"]],
+                      ["tool": "screenshot", "arguments": ["target_pid": 42, "target_window_id": 7, "width": 900]],
+                      ["tool": "click_element", "arguments": ["target_pid": 42, "target_window_id": 7, "expected_state_token": "t", "element_id": "ax_3"]]],
+        ])
+        XCTAssertTrue(stopped.isError)
+        let halted = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(stopped.text.utf8)) as? [String: Any])
+        XCTAssertEqual(halted["failed_step"] as? Int, 1)
+        XCTAssertEqual((halted["results"] as? [[String: Any]])?.count, 2, "nothing after the failed step may run")
+
+        // A step cannot start another loop of its own.
+        let nested = try await call(handler, "run_steps", ["steps": [["tool": "run_steps", "arguments": ["steps": []]]]])
+        XCTAssertTrue(nested.isError)
+        let empty = try await call(handler, "run_steps", ["steps": []])
+        XCTAssertTrue(empty.isError)
     }
 
     func testToolsListContainsNativeAndBrowserTools() async throws {
@@ -209,10 +280,15 @@ final class NativeMCPTests: XCTestCase {
         let message = try await response(#"{"jsonrpc":"2.0","id":"tools","method":"tools/list"}"#, from: handler)
         let result = try XCTUnwrap(message["result"] as? [String: Any])
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
+        // One listed tool per job. The earlier pixel and key tools duplicated click, type_text,
+        // press_key and move_cursor with a different contract; they stay callable but unlisted.
+        let unlisted: Set<String> = ["left_click", "right_click", "type", "key", "mouse_move", "cursor_position"]
+        XCTAssertTrue(unlisted.isDisjoint(with: tools.compactMap { $0["name"] as? String }))
+        XCTAssertTrue(unlisted.isSubset(of: ManagedComputerUseMCP.callableToolNames))
         XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), Set([
-            "screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "cua_status",
-            "left_click", "type", "click_element", "set_value", "menu_shortcut", "restore_window", "right_click", "mouse_move", "scroll", "key",
-            "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status", "run_subtask",
+            "screenshot", "zoom", "list_windows", "get_ui_tree", "jev_decide", "doctor", "cua_status",
+            "click_element", "set_value", "menu_shortcut", "restore_window", "scroll",
+            "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status", "run_subtask", "run_steps",
         ]).union(ChromeProfileComputerUseBackend.tools)
             .union(DesktopToolsBackend.observationTools + DesktopToolsBackend.mutationTools)
             .union(InputToolsBackend.observationTools + InputToolsBackend.mutationTools)
@@ -243,7 +319,7 @@ final class NativeMCPTests: XCTestCase {
         let handler = ManagedComputerUseMCP(
             queue: ComputerUseHostQueue(lockURL: lock), backend: backend, jevAvailable: { false })
         func call(_ risks: String) async throws -> (text: String, isError: Bool) {
-            let line = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Save","target_pid":42,"target_window_id":7,"ocr":"always","allowed_risks":"# + risks + "}}}"
+            let line = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jev_decide","arguments":{"goal":"Save","target_pid":42,"target_window_id":7,"allowed_risks":"# + risks + "}}}"
             let message = try await response(line, from: handler)
             let result = try XCTUnwrap(message["result"] as? [String: Any])
             let parts = try XCTUnwrap(result["content"] as? [[String: Any]])
@@ -263,9 +339,15 @@ final class NativeMCPTests: XCTestCase {
         XCTAssertEqual(backend.ocrModes, ["never", "never"])
     }
 
-    func testSetValueAndMenuShortcutRejectStaleTokenBeforeTouchingAX() async throws {
+    func testStaleTokenBlocksOnlyWhatDependsOnTheWholeObservation() async throws {
+        // In a live window (a new message, a counter, a caret blink) the whole-tree token is
+        // stale before any action arrives, which made every Slack and Chrome action fail. A
+        // role+label selector is found again on the current tree, where it must still be unique,
+        // so it does not need the tree unchanged. A positional id from an observation this server
+        // does not hold, and a menu chord, still do.
         let target = ComputerUseNativeHostTarget(pid: 42, windowID: 7)
         let window = ComputerUseNativeWindow(target: target, bounds: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let state = NativeInputTestState()
         let backend = ComputerUseNativeHostBackend(hooks: .init(
             listWindows: { _ in [window] },
             userActivity: { _ in .none },
@@ -275,20 +357,21 @@ final class NativeMCPTests: XCTestCase {
             screenCapturePermission: { true },
             capture: { _ in .unavailable("offline") },
             uiTree: { _ in "tree" },
-            setValue: { _, _, _, _, _ in XCTFail("stale token must not set a value"); return .applied },
-            menuShortcut: { _, _, _ in XCTFail("stale token must not press a menu"); return .applied }
+            setValue: { _, role, label, value, _ in state.record("set:\(role):\(label)=\(value)", []); return .applied },
+            menuShortcut: { _, _, _ in XCTFail("stale token must not press a menu"); return .applied },
+            setValueByID: { _, _, _, _ in XCTFail("an id from an unknown observation must not set a value"); return .applied }
         ))
-        let value = await backend.invoke(name: "set_value", arguments: [
-            "target_pid": 42, "target_window_id": 7, "expected_state_token": "stale",
-            "role": "AXTextField", "label": "Name", "value": "x",
-        ])
-        XCTAssertTrue(value.isError)
-        XCTAssertTrue(value.content[0].text?.contains("stale_state_token") == true)
-        let menu = await backend.invoke(name: "menu_shortcut", arguments: [
-            "target_pid": 42, "target_window_id": 7, "expected_state_token": "stale", "chord": "MOD+S",
-        ])
+        let base: [String: Any] = ["target_pid": 42, "target_window_id": 7, "expected_state_token": "stale"]
+        let byLabel = await backend.invoke(name: "set_value", arguments: base.merging(["role": "AXTextField", "label": "Name", "value": "x"]) { _, new in new })
+        XCTAssertFalse(byLabel.isError, byLabel.content[0].text ?? "")
+        XCTAssertEqual(state.actions.map(\.0), ["set:AXTextField:Name=x"])
+        let byID = await backend.invoke(name: "set_value", arguments: base.merging(["element_id": "ax_1", "value": "x"]) { _, new in new })
+        XCTAssertTrue(byID.isError)
+        XCTAssertTrue(byID.content[0].text?.contains("stale_state_token") == true)
+        let menu = await backend.invoke(name: "menu_shortcut", arguments: base.merging(["chord": "MOD+S"]) { _, new in new })
         XCTAssertTrue(menu.isError)
         XCTAssertTrue(menu.content[0].text?.contains("stale_state_token") == true)
+        XCTAssertEqual(state.actions.count, 1)
     }
 
     func testSetValueAndMenuShortcutReportSettleAndFreshObservation() async throws {
@@ -485,6 +568,27 @@ final class NativeMCPTests: XCTestCase {
         )
         configure(&hooks)
         return ComputerUseNativeHostBackend(hooks: hooks)
+    }
+
+    func testEscalationPressesWhileTheUserIsOnTheWindowAndTheRefusalSaysHow() async throws {
+        // The user asked for stealth first and escalation when nothing else works: the refusal
+        // must name the retry, and the retry must reach the element despite their activity.
+        let pressed = NativeInputTestState()
+        let backend = semanticBackend { hooks in
+            hooks.userActivity = { _ in .human }
+            hooks.semanticActionByID = { _, id in pressed.record(id, []); return true }
+        }
+        let observed = await backend.invoke(name: "get_ui_tree", arguments: ["target_pid": 42, "target_window_id": 7, "ocr": "never"])
+        let token = try XCTUnwrap(try observation(observed)["state_token"] as? String)
+        let base: [String: Any] = ["target_pid": 42, "target_window_id": 7, "expected_state_token": token, "element_id": "ax_3"]
+        let refused = await backend.invoke(name: "click_element", arguments: base)
+        XCTAssertTrue(refused.isError)
+        XCTAssertTrue(refused.content[0].text?.contains("human_activity") == true)
+        XCTAssertTrue(refused.content[0].text?.contains("allow_while_user_active") == true)
+        XCTAssertTrue(pressed.actions.isEmpty)
+        let allowed = await backend.invoke(name: "click_element", arguments: base.merging(["allow_while_user_active": true]) { _, new in new })
+        XCTAssertFalse(allowed.isError, allowed.content[0].text ?? "")
+        XCTAssertEqual(pressed.actions.map(\.0), ["ax_3"])
     }
 
     func testElementIDResolvesForClickAndSetValueAndRejectsStaleToken() async throws {
@@ -730,6 +834,137 @@ final class NativeMCPTests: XCTestCase {
         let stale = await quietBackend.invoke(name: "type", arguments: args)
         XCTAssertTrue(stale.isError)
         XCTAssertTrue(stale.content[0].text?.contains("stale_state_token") == true)
+    }
+
+    private final class LiveWindow: @unchecked Sendable {
+        var bounds = CGRect(x: 100, y: 30, width: 1668, height: 1264)
+        var pixels = "aW1hZ2UtMQ=="
+    }
+
+    func testClicksReadFromAScaledScreenshotLandOnTheSamePlaceInTheWindow() async throws {
+        // A 1668x1264-point window is a 3336x2528 Retina frame. The caller is given 1366x1035 and
+        // picks pixels in that image; read as frame pixels they landed up and to the left, on
+        // other controls. The result must also say what size the pixels are measured in.
+        let target = ComputerUseNativeHostTarget(pid: 42, windowID: 7)
+        let live = LiveWindow()
+        let state = NativeInputTestState()
+        let backend = ComputerUseNativeHostBackend(hooks: .init(
+            listWindows: { _ in [ComputerUseNativeWindow(target: target, bounds: live.bounds)] },
+            userActivity: { _ in .none },
+            activityMonitorAvailable: { true },
+            accessibilityPermission: { true },
+            axTargetAvailable: { _ in true },
+            screenCapturePermission: { true },
+            capture: { _ in .success(ComputerUseNativeCapture(data: live.pixels, mimeType: "image/png", sourcePixelSize: [3336, 2528], outputPixelSize: [1366, 1035])) },
+            uiTree: { _ in "tree" },
+            leftClick: { _, coordinate in state.record("click", coordinate); return .applied },
+            settleWatcher: { _ in .immediate }
+        ))
+        let screenshot = await backend.invoke(name: "screenshot", arguments: ["target_pid": 42, "target_window_id": 7])
+        let seen = try observation(screenshot)
+        XCTAssertEqual(seen["image_size"] as? [Int], [1366, 1035])
+        XCTAssertEqual(seen["window_size"] as? [Double], [1668, 1264])
+        let base: [String: Any] = ["target_pid": 42, "target_window_id": 7, "expected_state_token": try XCTUnwrap(seen["state_token"] as? String)]
+
+        let center = await backend.invoke(name: "left_click", arguments: base.merging(["coordinate": [683.0, 517.5]]) { _, new in new })
+        XCTAssertFalse(center.isError, center.content[0].text ?? "")
+        let point = try XCTUnwrap(state.actions.last?.1)
+        XCTAssertEqual(point[0], 100 + 834, accuracy: 1)
+        XCTAssertEqual(point[1], 30 + 632, accuracy: 1)
+
+        // A pixel outside the image the caller holds is refused rather than clamped.
+        let outside = await backend.invoke(name: "left_click", arguments: base.merging(["coordinate": [1400.0, 10.0]]) { _, new in new })
+        XCTAssertTrue(outside.isError)
+
+        // The page repainted (a video frame, a caret): the frame is the same, so the pixels still mean the same place.
+        live.pixels = "aW1hZ2UtMg=="
+        let repainted = await backend.invoke(name: "left_click", arguments: base.merging(["coordinate": [10.0, 10.0]]) { _, new in new })
+        XCTAssertFalse(repainted.isError, repainted.content[0].text ?? "")
+
+        // The window moved: the same pixels would now be somewhere else on screen.
+        live.bounds = CGRect(x: 400, y: 30, width: 1668, height: 1264)
+        let moved = await backend.invoke(name: "left_click", arguments: base.merging(["coordinate": [10.0, 10.0]]) { _, new in new })
+        XCTAssertTrue(moved.isError)
+        XCTAssertTrue(moved.content[0].text?.contains("stale_state_token") == true)
+        XCTAssertEqual(state.actions.count, 2)
+    }
+
+    func testAnAccessibilityActionThatActivatesItsAppHandsTheFrontBack() async throws {
+        // click_element is a background tool. When the pressed control makes its app come
+        // forward, the app the user was in is reactivated and the result says so.
+        let front = NativeInputTestState()
+        let backend = semanticBackend { hooks in
+            hooks.semanticActionByID = { _, _ in front.isFocused = true; return true }
+            hooks.frontmostPID = { front.isFocused ? 42 : 99 }
+            hooks.activateApp = { pid in front.record("activate", [Double(pid)]); front.isFocused = false; return true }
+        }
+        let observed = await backend.invoke(name: "get_ui_tree", arguments: ["target_pid": 42, "target_window_id": 7, "ocr": "never"])
+        let token = try XCTUnwrap(try observation(observed)["state_token"] as? String)
+        let result = await backend.invoke(name: "click_element", arguments: ["target_pid": 42, "target_window_id": 7, "expected_state_token": token, "element_id": "ax_3"])
+        XCTAssertFalse(result.isError, result.content[0].text ?? "")
+        XCTAssertEqual(front.actions.map(\.1), [[99]])
+        XCTAssertTrue(result.content.last?.text?.hasPrefix("focus: ") == true)
+        // The structured observation is still the first part.
+        XCTAssertNotNil(try observation(result)["state_token"])
+    }
+
+    func testRefusalsSayWhatToDoNext() async throws {
+        // A bare code such as stale_state_token sent the agent into repeating the same call.
+        let backend = semanticBackend()
+        let stale = await backend.invoke(name: "click_element", arguments: [
+            "target_pid": 42, "target_window_id": 7, "expected_state_token": "old", "element_id": "ax_1",
+        ])
+        XCTAssertTrue(stale.isError)
+        let text = try XCTUnwrap(stale.content.first?.text)
+        XCTAssertTrue(text.hasPrefix("native computer-use error: stale_state_token: "), text)
+        XCTAssertTrue(text.contains("get_ui_tree"), text)
+        // The observation still follows on its own line for callers that parse it.
+        XCTAssertNotNil(try observation(stale)["state_token"])
+        let missing = await backend.invoke(name: "click_element", arguments: ["target_pid": 42, "target_window_id": 9, "expected_state_token": "t", "element_id": "ax_1"])
+        XCTAssertTrue(missing.content.first?.text?.contains("list_windows") == true)
+    }
+
+    func testWebAccessibilityIsRequestedWithoutPuttingNativeAppsInScreenReaderMode() {
+        // A Chromium or Electron window reads as a toolbar until the app is asked to build its
+        // page tree. The side-effect-free switch is tried first; the legacy one changes how a
+        // native app behaves for the rest of its life, so only the Chromium family may get it.
+        typealias Platform = ComputerUseNativeHostBackend.NativePlatform
+        var written: [String] = []
+        func optIn(_ answers: [String: AXError], chromium: Bool) -> String? {
+            written = []
+            return Platform.webAccessibilityOptIn(set: { written.append($0); return answers[$0] ?? .failure }, chromiumFamily: { chromium })
+        }
+        XCTAssertEqual(optIn(["AXManualAccessibility": .success], chromium: false), "AXManualAccessibility")
+        XCTAssertEqual(written, ["AXManualAccessibility"])
+        XCTAssertEqual(optIn(["AXManualAccessibility": .attributeUnsupported, "AXEnhancedUserInterface": .success], chromium: true), "AXEnhancedUserInterface")
+        XCTAssertNil(optIn(["AXManualAccessibility": .attributeUnsupported, "AXEnhancedUserInterface": .success], chromium: false))
+        XCTAssertEqual(written, ["AXManualAccessibility"], "a native app must never be sent the legacy switch")
+        // A busy app is not an app without the attribute; do not escalate on a transient error.
+        XCTAssertNil(optIn(["AXManualAccessibility": .cannotComplete, "AXEnhancedUserInterface": .success], chromium: true))
+        XCTAssertEqual(written, ["AXManualAccessibility"])
+
+        XCTAssertTrue(Platform.isChromiumFamily(frameworks: ["Google Chrome Framework.framework"]))
+        XCTAssertTrue(Platform.isChromiumFamily(frameworks: ["Squirrel.framework", "Electron Framework.framework"]))
+        XCTAssertFalse(Platform.isChromiumFamily(frameworks: ["Sparkle.framework", "ChromaKit.framework"]))
+        XCTAssertFalse(Platform.isChromiumFamily(frameworks: []))
+    }
+
+    func testWindowFramesAreScaledToTheLimitBeforeEncoding() throws {
+        // Encoding the Retina frame and letting each client shrink it differently is what made
+        // coordinates ambiguous; a zoom crop stays at native detail because detail is its point.
+        let context = try XCTUnwrap(CGContext(data: nil, width: 400, height: 300, bitsPerComponent: 8, bytesPerRow: 0,
+                                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let frame = try XCTUnwrap(context.makeImage())
+        guard case .success(let bounded) = ComputerUseNativeHostBackend.encodePreparedCapture(image: frame, region: nil, maxDimension: 200) else { return XCTFail() }
+        XCTAssertEqual(bounded.sourcePixelSize, [400, 300])
+        XCTAssertEqual(bounded.outputPixelSize, [200, 150])
+        guard case .success(let native) = ComputerUseNativeHostBackend.encodePreparedCapture(image: frame, region: nil, maxDimension: 0) else { return XCTFail() }
+        XCTAssertNil(native.outputPixelSize)
+        guard case .success(let fits) = ComputerUseNativeHostBackend.encodePreparedCapture(image: frame, region: nil, maxDimension: 1366) else { return XCTFail() }
+        XCTAssertNil(fits.outputPixelSize)
+        guard case .success(let zoom) = ComputerUseNativeHostBackend.encodePreparedCapture(image: frame, region: CGRect(x: 0, y: 0, width: 300, height: 300), maxDimension: 200) else { return XCTFail() }
+        XCTAssertNil(zoom.outputPixelSize)
+        XCTAssertLessThan(bounded.data.count, native.data.count + 1)
     }
 
     func testPixelFallbacksAreBoundsCheckedAndAXMissDispatchesOneClick() async throws {

@@ -21,6 +21,12 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
         (try? DesktopToolsBackend().readConfig()["max_image_dimension"] as? Int) ?? 0
     }
 
+    /// Window screenshots are always bounded: the configured limit, or the default when none is set.
+    public static func windowImageDimension() -> Int {
+        let configured = maxImageDimension()
+        return configured > 0 ? configured : ComputerUseNativeHostBackend.defaultMaxImageDimension
+    }
+
     public static func description(for name: String) -> String? {
         switch name {
         case "list_apps": return "List running and installed applications, including PID, bundle identity and active state."
@@ -34,7 +40,7 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
         case "clipboard_read": return "List clipboard types; include text only when include_text is true."
         case "clipboard_write": return "Replace clipboard with exactly one of text, image_path or file_path. Paths must be absolute and contain no symlinks."
         case "check_permissions": return "Check Accessibility and Screen Recording permissions; prompt only when requested."
-        case "health_report": return "Report permissions, activity monitor availability, cua CLI and version. Chrome probe skipped to avoid blocking."
+        case "health_report": return "Report permissions, activity monitor availability, cua CLI, version and whether the Chrome extension is installed, connected and current (a probe bounded to 2 seconds)."
         case "get_config": return "Read persisted desktop configuration; max_image_dimension zero means no resize."
         case "set_config": return "Persist max_image_dimension, a nonnegative integer, in ~/.mac-use/config.json."
         default: return nil
@@ -69,6 +75,9 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
             properties["max_image_dimension"] = ["type": "integer", "minimum": 0]
             required = ["max_image_dimension"]
         default: break
+        }
+        if ["launch_app", "kill_app", "bring_to_front", "set_window_frame", "clipboard_write"].contains(name) {
+            properties["allow_while_user_active"] = ChromeProfileComputerUseBackend.allowWhileUserActive
         }
         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required, "additionalProperties": false]
         if name == "launch_app" { schema["oneOf"] = [["required": ["bundle_id"]], ["required": ["name"]]] }
@@ -154,7 +163,7 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
             case "check_permissions": return Self.result(Self.permissions(prompt: arguments["prompt"] as? Bool ?? false))
             case "health_report":
                 let executable = (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin").split(separator: ":").map { URL(fileURLWithPath: String($0)).appendingPathComponent("cua").path }.first { FileManager.default.isExecutableFile(atPath: $0) }
-                return Self.result(["permissions": Self.permissions(prompt: false), "activity_monitor_available": ComputerUseNativeHostBackend.NativePlatform.activityMonitoringAvailable(), "chrome_extension": ["status": "skipped", "reason": "bridge request may block"], "cua_cli_present": executable != nil, "cua_cli_path": executable as Any? ?? NSNull(), "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"])
+                return Self.result(["permissions": Self.permissions(prompt: false), "activity_monitor_available": ComputerUseNativeHostBackend.NativePlatform.activityMonitoringAvailable(), "chrome_extension": ChromeProfileConnection.extensionStatus(), "cua_cli_present": executable != nil, "cua_cli_path": executable as Any? ?? NSNull(), "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"])
             case "list_apps": return Self.result(await MainActor.run { Self.listApps() })
             case "get_accessibility_tree":
                 return Self.result(await MainActor.run {
@@ -248,7 +257,9 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
         var targets = ComputerUseNativeHostBackend.NativePlatform.listWindows(bundleID: nil).filter { $0.target.pid == pid }.map(\.target)
         if let windowID { targets = [.init(pid: pid, windowID: windowID)] }
         if targets.isEmpty { targets = [.init(pid: pid, windowID: 0)] }
-        for target in targets where ComputerUseNativeHostBackend.NativePlatform.userActivity(target: target) == .human { throw Failure(message: "human_activity") }
+        for target in targets where ComputerUseNativeHostBackend.NativePlatform.userActivity(target: target) == .human {
+            throw Failure(message: "human_activity: " + ChromeProfileComputerUseBackend.humanActivityHint)
+        }
     }
 
     @MainActor private func launch(_ arguments: [String: Any]) async throws -> ComputerUseToolResult {
@@ -257,7 +268,9 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
         if let bundleID = arguments["bundle_id"] as? String { url = workspace.urlForApplication(withBundleIdentifier: bundleID) }
         else { url = workspace.urlForApplication(withBundleIdentifier: arguments["name"] as! String) ?? workspace.fullPath(forApplication: arguments["name"] as! String).map { URL(fileURLWithPath: $0) } }
         guard let url else { throw Failure(message: "Application not found") }
-        for app in workspace.runningApplications where app.bundleURL == url { try Self.refuseHumanActivity(pid: app.processIdentifier) }
+        if arguments["allow_while_user_active"] as? Bool != true {
+            for app in workspace.runningApplications where app.bundleURL == url { try Self.refuseHumanActivity(pid: app.processIdentifier) }
+        }
         let previous = workspace.frontmostApplication
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
@@ -279,12 +292,13 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
         let pid = Int32(arguments["pid"] as! Int)
         let windowID = (arguments["window_id"] as? Int).map(UInt32.init)
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { throw Failure(message: "Application not running") }
-        try refuseHumanActivity(pid: pid, windowID: name == "set_window_frame" ? windowID : nil)
+        let yieldsToUser = arguments["allow_while_user_active"] as? Bool != true
+        if yieldsToUser { try refuseHumanActivity(pid: pid, windowID: name == "set_window_frame" ? windowID : nil) }
         if name == "kill_app" {
             let terminated = app.forceTerminate()
             var fallback = false
             if !terminated || !app.isTerminated {
-                try refuseHumanActivity(pid: pid)
+                if yieldsToUser { try refuseHumanActivity(pid: pid) }
                 if !app.isTerminated {
                     guard Darwin.kill(pid, SIGKILL) == 0 || errno == ESRCH else { throw Failure(message: "SIGKILL failed: \(errno)") }
                     fallback = true
@@ -325,7 +339,9 @@ public final class DesktopToolsBackend: ComputerUseToolBackend, @unchecked Senda
     }
 
     @MainActor private static func writeClipboard(_ arguments: [String: Any]) throws -> ComputerUseToolResult {
-        if let app = NSWorkspace.shared.frontmostApplication { try refuseHumanActivity(pid: app.processIdentifier) }
+        if arguments["allow_while_user_active"] as? Bool != true, let app = NSWorkspace.shared.frontmostApplication {
+            try refuseHumanActivity(pid: app.processIdentifier)
+        }
         let object: NSPasteboardWriting
         if let text = arguments["text"] as? String { object = text as NSString }
         else if let path = arguments["image_path"] as? String {

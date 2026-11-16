@@ -70,18 +70,27 @@ public enum NativeSettle {
     public struct Result: Sendable, Equatable {
         public let settled: Bool
         public let elapsedMilliseconds: Int
+        /// Whether the app reported any change after the action; nil when nothing was listening.
+        public let reacted: Bool?
 
-        public init(settled: Bool, elapsedMilliseconds: Int) {
+        public init(settled: Bool, elapsedMilliseconds: Int, reacted: Bool? = nil) {
             self.settled = settled
             self.elapsedMilliseconds = elapsedMilliseconds
+            self.reacted = reacted
         }
 
         func combined(with other: Result) -> Result {
             Result(
                 settled: settled && other.settled,
-                elapsedMilliseconds: elapsedMilliseconds + other.elapsedMilliseconds
+                elapsedMilliseconds: elapsedMilliseconds + other.elapsedMilliseconds,
+                reacted: reacted == nil && other.reacted == nil ? nil : (reacted ?? false) || (other.reacted ?? false)
             )
         }
+
+        /// An accepted action is not a delivered one, so say when a change was seen. Silence is
+        /// not evidence of the opposite: a page with its accessibility tree off changes without
+        /// telling anyone, and calling that a no-op would invite repeating a toggle.
+        public var effect: String { reacted == true ? "ui_changed" : "unverified" }
     }
 
     /// `waitForNotification(timeout)` blocks up to `timeout` seconds and returns
@@ -96,7 +105,7 @@ public enum NativeSettle {
         while true {
             let elapsed = now() - start
             if elapsed >= maximumDuration {
-                return Result(settled: false, elapsedMilliseconds: milliseconds(elapsed))
+                return Result(settled: false, elapsedMilliseconds: milliseconds(elapsed), reacted: sawNotification)
             }
             let window = sawNotification ? quietWindow : firstNotificationWindow
             let timeout = min(window, maximumDuration - elapsed)
@@ -105,7 +114,7 @@ public enum NativeSettle {
                 continue
             }
             let total = now() - start
-            return Result(settled: timeout >= window, elapsedMilliseconds: milliseconds(total))
+            return Result(settled: timeout >= window, elapsedMilliseconds: milliseconds(total), reacted: sawNotification)
         }
     }
 
@@ -368,11 +377,14 @@ public struct ComputerUseNativeCapture: Sendable, Equatable {
     /// Full-frame pixel size before any zoom crop. Set when the capture
     /// source retained a live `CGImage` so zoom can skip a second PNG inflate.
     public let sourcePixelSize: [Int]?
+    /// Size of the encoded image when it was scaled down from the frame.
+    public let outputPixelSize: [Int]?
 
-    public init(data: String, mimeType: String, sourcePixelSize: [Int]? = nil) {
+    public init(data: String, mimeType: String, sourcePixelSize: [Int]? = nil, outputPixelSize: [Int]? = nil) {
         self.data = data
         self.mimeType = mimeType
         self.sourcePixelSize = sourcePixelSize
+        self.outputPixelSize = outputPixelSize
     }
 }
 
@@ -594,6 +606,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public var settleWatcher: @Sendable (ComputerUseNativeHostTarget) -> NativeSettleWatcher = {
             NativePlatform.settleWatcher(target: $0)
         }
+        /// The app in front, and a request to put one back there (see `returnFocus`).
+        public var frontmostPID: @Sendable () -> Int32? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+        public var activateApp: @Sendable (Int32) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activate(options: []) ?? false }
+        /// Long-edge limit for a window screenshot when the call does not give one.
+        public var maxImageDimension: @Sendable () -> Int = { DesktopToolsBackend.windowImageDimension() }
         /// Same as the role+label hooks, addressed by a get_ui_tree `ax_<n>` id.
         public var semanticActionByID: @Sendable (ComputerUseNativeHostTarget, String) -> Bool = {
             NativePlatform.semanticAction(target: $0, elementID: $1)
@@ -757,8 +774,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     private struct PixelScope: Equatable {
         let fullImageSize: [Int]
         let region: [Int]?
+        /// Size of the image the caller received when it was scaled down; its coordinates are in this space.
+        var imageSize: [Int]? = nil
 
         var outputImageSize: [Int] {
+            if let imageSize, imageSize.count == 2 { return imageSize }
             guard let region, region.count == 4 else { return fullImageSize }
             return [region[2], region[3]]
         }
@@ -774,11 +794,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let fullImageSize: [Int]
         let region: [Int]?
         let pixelsDigest: String
+        var imageSize: [Int]? = nil
 
         var scope: PixelScope {
             PixelScope(
                 fullImageSize: fullImageSize,
-                region: region
+                region: region,
+                imageSize: imageSize
             )
         }
     }
@@ -832,7 +854,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     /// public capture-hook arity.
     enum CaptureZoomContext {
         @TaskLocal static var region: CGRect?
+        /// Long-edge limit for the encoded window image; 0 keeps the native frame.
+        @TaskLocal static var maxDimension: Int = 0
     }
+
+    /// Models see screenshots resized by their client. A Retina frame leaves no way to know by how
+    /// much, so clicks read from it land elsewhere; a frame this size is passed through unchanged.
+    public static let defaultMaxImageDimension = 1366
 
     public init(hooks: Hooks = Hooks()) {
         self.hooks = hooks
@@ -870,11 +898,22 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 requestedRegion = nil
             }
 
+            let limit: Int
+            if name == "zoom" {
+                limit = 0
+            } else if let raw = arguments["max_image_dimension"] {
+                guard let requested = Self.exactPixelInteger(raw), requested >= 0 else {
+                    return failure(.invalid_target, "max_image_dimension must be a non-negative integer; 0 keeps the native frame")
+                }
+                limit = requested
+            } else {
+                limit = hooks.maxImageDimension()
+            }
             var capture: ComputerUseNativeCapture?
             let captureFailure: String?
             if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
                 switch await CaptureZoomContext.$region.withValue(requestedRegion, operation: {
-                    await hooks.capture(target)
+                    await CaptureZoomContext.$maxDimension.withValue(limit) { await hooks.capture(target) }
                 }) {
                 case .success(let image), .quartzFallback(let image):
                     if Self.captureDataExceedsBudget(image) {
@@ -911,7 +950,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                                 Int($0.origin.x), Int($0.origin.y),
                                 Int($0.width), Int($0.height),
                             ]
-                        }
+                        },
+                        imageSize: requestedRegion == nil ? applied.capture.outputPixelSize : nil
                     )
                 } else {
                     let observation = await makeObservation(
@@ -931,8 +971,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 content: capture?.data ?? "<pixels-unavailable>",
                 pixelScope: pixelScope
             )
+            if name == "screenshot", capture != nil, let pixelScope {
+                NativeSnapshotStore.shared.recordScreenshot(target: target, imageSize: pixelScope.outputImageSize, windowSize: window.bounds.size)
+            }
             return captureResult(
                 observation: observation,
+                imageSize: capture == nil ? nil : pixelScope?.outputImageSize,
+                windowSize: window.bounds.size,
                 image: capture,
                 failureReason: captureFailure
             )
@@ -950,6 +995,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   let tree else {
                 return failure(.ui_tree_unavailable, encodeObservation(observation))
             }
+            NativeSnapshotStore.shared.deliver(token: observation.stateToken, target: target)
             // OCR is evidence appended after the AX tree; it never changes the
             // semantic token and never fails the call.
             let perception = await ocrPerception(mode: ocrMode, tree: tree, target: target, observation: observation)
@@ -969,14 +1015,18 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             // Preflight only needs metadata. Read the expensive pixels/AX tree
             // once, after the human-activity check, in mutate's final validation.
             let observation = await makeObservation(window: window, kind: .geometry)
-            return await mutate(
-                name: name,
-                target: target,
-                window: window,
-                observation: observation,
-                tokenKind: kind,
-                arguments: arguments
-            )
+            let frontBefore = hooks.frontmostPID()
+            let result = await NativeSnapshotStore.$actionToken.withValue(arguments["expected_state_token"] as? String) {
+                await mutate(
+                    name: name,
+                    target: target,
+                    window: window,
+                    observation: observation,
+                    tokenKind: kind,
+                    arguments: arguments
+                )
+            }
+            return returnFocus(result, name: name, target: target, frontBefore: frontBefore)
         default:
             return failure(.invalid_target, "unsupported native computer-use operation: \(name)")
         }
@@ -1034,7 +1084,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                         observedContent = applied.capture.data
                         effectivePixelScope = PixelScope(
                             fullImageSize: applied.fullImageSize,
-                            region: pixelScope.region
+                            region: pixelScope.region,
+                            imageSize: pixelScope.imageSize
                         )
                     } else {
                         observedContent = capture.data
@@ -1058,6 +1109,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             content: observedContent,
             pixelScope: effectivePixelScope
         )
+        if kind == .semantic { NativeSnapshotStore.shared.bind(token: token, tree: observedContent, target: window.target) }
         return ComputerUseNativeHostObservation(
             target: window.target,
             stateToken: token,
@@ -1073,6 +1125,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
     private func captureResult(
         observation: ComputerUseNativeHostObservation,
+        imageSize: [Int]? = nil,
+        windowSize: CGSize = .zero,
         image: ComputerUseNativeCapture?,
         failureReason: String?
     ) -> ComputerUseToolResult {
@@ -1088,8 +1142,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let diagnostic = failureReason.map { "\n capture_failure: \($0)" } ?? ""
             return failure(.capture_unavailable, encodeObservation(observation) + diagnostic)
         }
+        // Say what the pixels mean: without the size the caller cannot tell a resized image from this one.
+        var extra: [String: Any] = [:]
+        if let imageSize {
+            extra["image_size"] = imageSize
+            extra["window_size"] = [Double(windowSize.width), Double(windowSize.height)]
+            extra["coordinates"] = "x,y for click tools are pixels of this image (image_size), top-left origin"
+        }
         return ComputerUseToolResult(content: [
-            .text(encodeObservation(observation)),
+            .text(encodeObservation(observation, extra: extra)),
             .image(data: image.data, mimeType: image.mimeType),
         ])
     }
@@ -1103,11 +1164,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         arguments: [String: Any]
     ) async -> ComputerUseToolResult {
         // Check the physical user before any permission or action probe: human
-        // activity always wins and cannot be hidden by a stale automation call.
+        // activity wins unless the caller escalated with allow_while_user_active,
+        // and cannot be hidden by a stale automation call.
         guard hooks.activityMonitorAvailable() else {
             return failure(.activity_monitor_unavailable, encodeObservation(observation))
         }
-        if hooks.userActivity(target) == .human {
+        let yieldsToUser = arguments["allow_while_user_active"] as? Bool != true
+        if yieldsToUser, hooks.userActivity(target) == .human {
             return failure(.human_activity, encodeObservation(observation))
         }
         if observation.isMinimized,
@@ -1143,12 +1206,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             kind: tokenKind,
             pixelScope: expectedPixelScope
         )
-        guard expected == freshObservation.stateToken else {
+        guard expected == freshObservation.stateToken
+                || survivesChange(name: name, target: target, expected: expected, fresh: freshObservation.stateToken, arguments: arguments) else {
             return failure(.stale_state_token, encodeObservation(freshObservation))
         }
         // The content read above can take time (AX traversal or a screenshot).
         // Give a physical user event observed during that window priority too.
-        if hooks.userActivity(target) == .human {
+        if yieldsToUser, hooks.userActivity(target) == .human {
             return failure(.human_activity, encodeObservation(freshObservation))
         }
 
@@ -1174,7 +1238,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard let currentWindow = resolve(target: target, arguments: arguments), currentWindow == freshWindow else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
-            if hooks.userActivity(target) == .human {
+            if yieldsToUser, hooks.userActivity(target) == .human {
                 return failure(.human_activity, encodeObservation(freshObservation))
             }
             let watcher = hooks.settleWatcher(target)
@@ -1221,7 +1285,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   let parsedKey = Self.parsedKey(arguments["key"], modifiers: arguments["modifiers"]) else {
                 return failure(.focus_required, encodeObservation(freshObservation))
             }
-            guard hooks.userActivity(target) != .human else {
+            guard !yieldsToUser || hooks.userActivity(target) != .human else {
                 return failure(.human_activity, encodeObservation(freshObservation))
             }
             guard let currentWindow = resolve(target: target, arguments: arguments) else {
@@ -1329,7 +1393,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 var submitted = false
                 // The value is already set; a user takeover or window change during the settle must block both submit paths.
                 func submitBlocked() -> ComputerUseToolResult? {
-                    if hooks.userActivity(target) == .human {
+                    if yieldsToUser, hooks.userActivity(target) == .human {
                         return failure(.human_activity, "value set; submit_key \(submitKey) not applied\n\(encodeObservation(freshObservation))")
                     }
                     guard let current = resolve(target: target, arguments: arguments) else {
@@ -1509,9 +1573,38 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return .success(categories)
     }
 
+    /// A background action must leave the user's app in front. Pressing or focusing a control makes
+    /// some apps bring themselves forward; when the target did that and the user did not go there
+    /// themselves, the front is handed back. restore_window is the one tool whose purpose is focus.
+    private func returnFocus(_ result: ComputerUseToolResult, name: String, target: ComputerUseNativeHostTarget,
+                             frontBefore: Int32?) -> ComputerUseToolResult {
+        guard name != "restore_window", let frontBefore, frontBefore != target.pid, hooks.frontmostPID() == target.pid,
+              hooks.userActivity(target) != .human else { return result }
+        let returned = hooks.activateApp(frontBefore)
+        var result = result
+        result.content.append(.text("focus: the target app brought itself to the front; \(returned ? "the app that was in front was reactivated" : "reactivating the app that was in front failed")"))
+        return result
+    }
+
+    /// What to do next, for the refusals a caller can act on. A bare code sent agents into
+    /// repeating the same call.
+    private static func hint(for error: Failure) -> String? {
+        switch error {
+        case .human_activity: return ChromeProfileComputerUseBackend.humanActivityHint
+        case .stale_state_token: return "the element or frame this action was read from is no longer current. Read the window again (get_ui_tree, or screenshot for pixel tools) and retry with what it returns."
+        case .missing_state_token: return "pass expected_state_token from the get_ui_tree or screenshot this action is based on."
+        case .target_not_found: return "that pid and window id are not on the window list now. Call list_windows."
+        case .focus_required: return "this route needs the exact window focused. Use click, press_key or hotkey with delivery_mode: \"foreground\", or restore_window, when the work cannot be done in the background."
+        case .semantic_action_failed: return "the accessibility action was not accepted or the selector did not match exactly one element. Read the window again; if the element is there, use click with element_id and action: \"pointer\"."
+        case .pixel_target_not_renderable: return "the window is minimized or off screen, so there are no pixels to act on. Use the accessibility tools, or restore_window."
+        default: return nil
+        }
+    }
+
     private func failure(_ error: Failure, _ detail: String) -> ComputerUseToolResult {
-        ComputerUseToolResult(
-            text: "native computer-use error: \(error.rawValue)\n\(detail)",
+        let hint = Self.hint(for: error).map { ": " + $0 } ?? ""
+        return ComputerUseToolResult(
+            text: "native computer-use error: \(error.rawValue)\(hint)\n\(detail)",
             isError: true
         )
     }
@@ -1561,6 +1654,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         if let settle {
             object["settle_ms"] = settle.elapsedMilliseconds
             object["settled"] = settle.settled
+            object["effect"] = settle.effect
         }
         if !observation.accessibilityPermission || !observation.screenCapturePermission {
             let launchedBy = hooks.hostLauncherPath()
@@ -1632,7 +1726,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 screenCapturePermission: screenCapturePermission,
                 fullImageSize: pixelScope.fullImageSize,
                 region: pixelScope.region,
-                pixelsDigest: contentDigest
+                pixelsDigest: contentDigest,
+                imageSize: pixelScope.imageSize
             )
             let encoder = Self.pixelTokenEncoder
             Self.pixelTokenCodecLock.lock()
@@ -1681,6 +1776,10 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
               envelope.fullImageSize.allSatisfy({ $0 > 0 }),
               !envelope.pixelsDigest.isEmpty else {
             return nil
+        }
+        if let imageSize = envelope.imageSize {
+            guard imageSize.count == 2, imageSize.allSatisfy({ $0 > 0 }),
+                  imageSize[0] <= envelope.fullImageSize[0], imageSize[1] <= envelope.fullImageSize[1] else { return nil }
         }
         if let region = envelope.region {
             guard
@@ -1834,12 +1933,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
               window.bounds.origin.x.isFinite, window.bounds.origin.y.isFinite,
               window.bounds.width.isFinite, window.bounds.height.isFinite,
               window.bounds.width > 0, window.bounds.height > 0 else { return nil }
-        let fullCoordinate: [Double]
-        if let region = scope.region, region.count == 4 {
-            fullCoordinate = [Double(region[0]) + local[0], Double(region[1]) + local[1]]
-        } else {
-            fullCoordinate = local
-        }
+        // `local` is in the image the caller received; scale it onto the part of the frame it shows.
+        let shown: [Double] = scope.region.flatMap { $0.count == 4 ? $0.map(Double.init) : nil }
+            ?? [0, 0, Double(scope.fullImageSize[0]), Double(scope.fullImageSize[1])]
+        let fullCoordinate = [
+            shown[0] + local[0] * shown[2] / Double(scope.outputImageSize[0]),
+            shown[1] + local[1] * shown[3] / Double(scope.outputImageSize[1]),
+        ]
         let scaleX = Double(scope.fullImageSize[0]) / window.bounds.width
         let scaleY = Double(scope.fullImageSize[1]) / window.bounds.height
         guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
@@ -1848,6 +1948,34 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
               fullCoordinate[1] < Double(scope.fullImageSize[1]) else { return nil }
         return [window.bounds.minX + fullCoordinate[0] / scaleX,
                 window.bounds.minY + fullCoordinate[1] / scaleY]
+    }
+
+    /// The token hashes the whole observation, so in a live window (a new message, a counter, a
+    /// caret blink) it is stale before the action arrives. What an action depends on is narrower.
+    private func survivesChange(name: String, target: ComputerUseNativeHostTarget, expected: String, fresh: String,
+                                arguments: [String: Any]) -> Bool {
+        switch name {
+        case "click_element", "set_value":
+            switch NativeElementSelector.parse(arguments).selector {
+            case .roleLabel:
+                // Found again on the current tree, where it must still be the only match.
+                return true
+            case .id(let id):
+                guard let index = NativeElementID.index(id) else { return false }
+                if case .found = NativeSnapshotStore.shared.resolve(target: target, index: index, token: expected,
+                                                                    identity: NativePlatform.identity(of:)) { return true }
+                return false
+            case nil:
+                // Let the tool name what is wrong with the selector instead of calling it stale.
+                return true
+            }
+        case "left_click", "right_click", "mouse_move", "scroll":
+            // Coordinates depend on the frame they were read from, not on what was drawn in it.
+            guard let before = Self.decodePixelToken(expected), let now = Self.decodePixelToken(fresh) else { return false }
+            return before.scope == now.scope && before.windowBounds == now.windowBounds
+        default:
+            return false
+        }
     }
 
     private static func isBooleanNumber(_ value: Any?) -> Bool {
@@ -1966,9 +2094,24 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return encoded
     }
 
+    /// The frame drawn into at most `limit` pixels on its long edge.
+    static func scaled(_ image: CGImage, limit: Int) -> CGImage? {
+        let longEdge = max(image.width, image.height)
+        guard limit > 0, longEdge > limit else { return nil }
+        let ratio = Double(limit) / Double(longEdge)
+        let width = max(1, Int((Double(image.width) * ratio).rounded())), height = max(1, Int((Double(image.height) * ratio).rounded()))
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
     static func encodePreparedCapture(
         image: CGImage,
-        region: CGRect?
+        region: CGRect?,
+        maxDimension: Int = 0
     ) -> ComputerUseNativeCaptureResult {
         guard image.width > 0,
               image.height > 0,
@@ -1996,14 +2139,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             output = cropped
         } else {
-            output = image
+            output = scaled(image, limit: maxDimension) ?? image
         }
-        return encodePNGCapture(output, sourcePixelSize: sourcePixelSize)
+        return encodePNGCapture(output, sourcePixelSize: sourcePixelSize, scaledDown: region == nil && output !== image)
     }
 
     private static func encodePNGCapture(
         _ image: CGImage,
-        sourcePixelSize: [Int]
+        sourcePixelSize: [Int],
+        scaledDown: Bool = false
     ) -> ComputerUseNativeCaptureResult {
         guard let data = NSBitmapImageRep(cgImage: image)
             .representation(using: .png, properties: [:]) else {
@@ -2015,7 +2159,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return .success(ComputerUseNativeCapture(
             data: data.base64EncodedString(),
             mimeType: "image/png",
-            sourcePixelSize: sourcePixelSize
+            sourcePixelSize: sourcePixelSize,
+            outputPixelSize: scaledDown ? [image.width, image.height] : nil
         ))
     }
 
@@ -2452,25 +2597,27 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult {
+            let limit = CaptureZoomContext.maxDimension
             if screenCaptureStalled() {
-                return encodeQuartz(target: target, region: CaptureZoomContext.region, after: .quartzFallback("screen_capture_stalled_retry_later"))
+                return encodeQuartz(target: target, region: CaptureZoomContext.region, maxDimension: limit, after: .quartzFallback("screen_capture_stalled_retry_later"))
             }
             let region = CaptureZoomContext.region
             guard let result = await withDeadline(seconds: captureTotalTimeoutSeconds, {
-                await capture(target: target, region: region)
+                await capture(target: target, region: region, maxDimension: limit)
             }) else {
                 markScreenCaptureStalled()
-                return encodeQuartz(target: target, region: region, after: .quartzFallback("screen_capture_timeout"))
+                return encodeQuartz(target: target, region: region, maxDimension: limit, after: .quartzFallback("screen_capture_timeout"))
             }
             return result
         }
 
         static func capture(
             target: ComputerUseNativeHostTarget,
-            region: CGRect?
+            region: CGRect?,
+            maxDimension: Int = 0
         ) async -> ComputerUseNativeCaptureResult {
             guard let content = await shareableContent() else {
-                return encodeQuartz(target: target, region: region, after: .quartzFallback("shareable_content_unavailable"))
+                return encodeQuartz(target: target, region: region, maxDimension: maxDimension, after: .quartzFallback("shareable_content_unavailable"))
             }
             guard let window = content.windows.first(where: {
                 $0.windowID == CGWindowID(target.windowID)
@@ -2520,7 +2667,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             case .success(let image):
                 switch ComputerUseNativeHostBackend.encodePreparedCapture(
                     image: image,
-                    region: region
+                    region: region,
+                    maxDimension: maxDimension
                 ) {
                 case .success(let capture):
                     return usedQuartzFallback ? .quartzFallback(capture) : .success(capture)
@@ -2537,11 +2685,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         private static func encodeQuartz(
             target: ComputerUseNativeHostTarget,
             region: CGRect?,
+            maxDimension: Int = 0,
             after reason: CaptureImageFailure
         ) -> ComputerUseNativeCaptureResult {
             switch quartzWindowImage(target: target, after: reason) {
             case .success(let image):
-                switch ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: region) {
+                switch ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: region, maxDimension: maxDimension) {
                 case .success(let capture), .quartzFallback(let capture):
                     return .quartzFallback(capture)
                 case .unavailable(let failure):
@@ -2934,11 +3083,18 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return found
         }
 
+        /// The element the caller was shown as `id`. Counting to position n of today's tree
+        /// would land on a different control as soon as anything above it changed.
         static func element(target: ComputerUseNativeHostTarget, id: String) -> AXUIElement? {
-            guard AXIsProcessTrusted(),
-                  let index = NativeElementID.index(id),
-                  let window = exactAXWindow(target: target) else { return nil }
-            return element(atIndex: index, in: window)
+            guard AXIsProcessTrusted(), let index = NativeElementID.index(id) else { return nil }
+            switch NativeSnapshotStore.shared.resolve(target: target, index: index, token: NativeSnapshotStore.actionToken,
+                                                      identity: identity(of:)) {
+            case .found(let element): return element
+            case .changed: return nil
+            case .unknown:
+                guard let window = exactAXWindow(target: target) else { return nil }
+                return element(atIndex: index, in: window)
+            }
         }
 
         public static func semanticAction(target: ComputerUseNativeHostTarget, elementID: String) -> Bool {
@@ -3130,8 +3286,77 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, value) == .success
         }
 
+        private static let webAccessibilityLock = NSLock()
+        private static var webAccessibilityPIDs: Set<Int32> = []
+
+        /// Chromium and Electron build the accessibility tree of their pages only when asked.
+        /// Without it a browser window reads as a toolbar and nothing else. `AXManualAccessibility`
+        /// is the switch they provide for this; other apps reject it and are left as they are.
+        static func enableWebAccessibility(target: ComputerUseNativeHostTarget, window: AXUIElement) {
+            webAccessibilityLock.lock()
+            let first = webAccessibilityPIDs.insert(target.pid).inserted
+            if webAccessibilityPIDs.count > 64 { webAccessibilityPIDs = [target.pid] }
+            webAccessibilityLock.unlock()
+            let app = AXUIElementCreateApplication(target.pid)
+            guard first, webAccessibilityOptIn(
+                set: { AXUIElementSetAttributeValue(app, $0 as CFString, kCFBooleanTrue) },
+                chromiumFamily: { isChromiumFamily(pid: target.pid) }) != nil else { return }
+            // The page tree is built asynchronously; give the first read something to read.
+            func populatedWebArea(_ element: AXUIElement, depth: Int) -> Bool {
+                guard depth < 12 else { return false }
+                let kids = children(of: element)
+                if attribute(kAXRoleAttribute as CFString, from: element) as? String == "AXWebArea" { return !kids.isEmpty }
+                return kids.contains { populatedWebArea($0, depth: depth + 1) }
+            }
+            for _ in 0..<15 where !populatedWebArea(window, depth: 0) { usleep(100_000) }
+        }
+
+        /// The attribute that was accepted, if any. `AXManualAccessibility` has no side effects.
+        /// `AXEnhancedUserInterface` is what Chrome itself answers to, but it puts a native app in
+        /// screen-reader mode for the rest of its life, so it is written only to Chromium-family apps.
+        static func webAccessibilityOptIn(set: (String) -> AXError, chromiumFamily: () -> Bool) -> String? {
+            let manual = set("AXManualAccessibility")
+            if manual == .success { return "AXManualAccessibility" }
+            guard manual == .attributeUnsupported, chromiumFamily() else { return nil }
+            return set("AXEnhancedUserInterface") == .success ? "AXEnhancedUserInterface" : nil
+        }
+
+        /// Whether one window in front of `target` hides all of it. Windows come front to back.
+        static func windowFullyCovered(target: ComputerUseNativeHostTarget, bounds: CGRect) -> Bool {
+            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            return covered(target: target.windowID, bounds: bounds, frontToBack: windows.compactMap { info in
+                guard info[kCGWindowLayer as String] as? Int == 0, let id = info[kCGWindowNumber as String] as? UInt32,
+                      let raw = info[kCGWindowBounds as String], let frame = CGRect(dictionaryRepresentation: raw as! CFDictionary) else { return nil }
+                return (id, frame)
+            })
+        }
+
+        static func covered(target: UInt32, bounds: CGRect, frontToBack windows: [(id: UInt32, frame: CGRect)]) -> Bool {
+            for window in windows {
+                if window.id == target { return false }
+                if window.frame.contains(bounds) { return true }
+            }
+            return false
+        }
+
+        /// Chromium embedders ship the engine as "<Name> Framework.framework" beside renderer helpers.
+        static func isChromiumFamily(pid: Int32, frameworks: (URL) -> [String] = {
+            (try? FileManager.default.contentsOfDirectory(atPath: $0.appendingPathComponent("Contents/Frameworks").path)) ?? []
+        }) -> Bool {
+            guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleURL else { return false }
+            return isChromiumFamily(frameworks: frameworks(bundle))
+        }
+
+        static func isChromiumFamily(frameworks: [String]) -> Bool {
+            frameworks.contains { name in
+                name.hasSuffix(" Framework.framework")
+                    && ["Chrom", "Electron", "Edge", "Brave", "Vivaldi", "Opera", "Arc"].contains { name.contains($0) }
+            }
+        }
+
         public static func uiTree(target: ComputerUseNativeHostTarget) -> String? {
             guard AXIsProcessTrusted(), let window = exactAXWindow(target: target) else { return nil }
+            enableWebAccessibility(target: target, window: window)
             var budget = TreeBudget()
             let tree = serialize(element: window, depth: 0, budget: &budget)
             guard JSONSerialization.isValidJSONObject(tree),
@@ -3139,6 +3364,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   let result = String(data: data, encoding: .utf8) else {
                 return nil
             }
+            NativeSnapshotStore.shared.publish(target: target, tree: result, elements: budget.elements, identities: budget.identities)
             return result
         }
 
@@ -3406,6 +3632,19 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         private struct TreeBudget {
             var nodes = 0
+            var elements: [AXUIElement] = []
+            var identities: [NativeSnapshotStore.Identity] = []
+        }
+
+        /// The attributes a caller recognizes a control by. Values and layout are left out:
+        /// they change while the control stays the same control.
+        static func identity(of element: AXUIElement) -> NativeSnapshotStore.Identity? {
+            guard let role = attribute(kAXRoleAttribute as CFString, from: element) as? String else { return nil }
+            func text(_ name: String) -> String? {
+                (attribute(name as CFString, from: element) as? String).flatMap { $0.isEmpty ? nil : $0 }
+            }
+            return .init(role: role, title: text(kAXTitleAttribute), description: text(kAXDescriptionAttribute),
+                         identifier: text(kAXIdentifierAttribute))
         }
 
         private static func serialize(
@@ -3418,6 +3657,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             var result: [String: Any] = ["id": "ax_\(budget.nodes)"]
             budget.nodes += 1
+            budget.elements.append(element)
+            budget.identities.append(identity(of: element) ?? .init())
             if let role = attribute(kAXRoleAttribute as CFString, from: element) as? String { result["role"] = role }
             if let subrole = attribute(kAXSubroleAttribute as CFString, from: element) as? String {
                 result["subrole"] = subrole

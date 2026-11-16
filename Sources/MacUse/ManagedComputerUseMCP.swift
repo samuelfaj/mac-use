@@ -135,9 +135,31 @@ public struct ManagedComputerUseMCP: Sendable {
     static let recordedTools = Set(mutationTools + DesktopToolsBackend.mutationTools + InputToolsBackend.mutationTools
         + ChromeProfileComputerUseBackend.mutationTools)
 
-    public static var advertisedToolNames: [String] {
+    /// Every name that can be called.
+    /// The order of work in a few lines; the skill carries the detail.
+    static let instructions = [
+        "mac-use drives macOS windows and Chrome tabs. Read the mac-use skill (skills/mac-use/SKILL.md) for the full rules.",
+        "1. Web pages: call browser_status. When state is connected, use browser_open and the browser_* tools: your own background tab, elements by ref. Finish with browser_close on the same connection and check its result.",
+        "2. Native windows: list_windows gives target_pid and target_window_id. Read with get_ui_tree and a query, so you get only the rows you need: - [ax_n] role \"title\".",
+        "3. Act on an element: click_element, set_value, click or type_text with element_id, passing the state token of the read it came from as expected_state_token. The id keeps meaning the element you read while the window changes. Use screenshot and pixel x,y only for what the tree does not show; x,y are pixels of the returned image (image_size).",
+        "4. Read the result. effect is ui_changed when the app was seen to react, otherwise unverified; ok alone only means the input was accepted. On unverified, read the window again before repeating anything, above all a toggle. run_steps acts and reads in one call.",
+        "5. Stay out of the user's way first: background tabs, Accessibility actions and background delivery never take focus, and a mutation yields with human_activity while the user is on the target. When no quiet route can do the work, retry with allow_while_user_active: true (and delivery_mode foreground or restore_window where needed) instead of stopping, then say what you interrupted. Never escalate when the user said not to interrupt them.",
+        "6. Close what you opened (tabs, sessions, recordings) on success and on failure, and report cleanup you could not verify. Keep what the user took over.",
+        "With a Jev key, jev_decide, verify_state criteria and run_subtask give cheap text-only decisions; Jev never authorizes an action and never sees screenshots or field values. cua_status reports cua Spaces for work that does not need the user's own apps.",
+    ].joined(separator: "\n")
+
+    public static var callableToolNames: [String] {
         observationTools + mutationTools + ChromeProfileComputerUseBackend.tools
-            + desktopTools + inputTools + sessionTools
+            + desktopTools + inputTools + sessionTools + ["run_steps"]
+    }
+
+    /// Earlier names whose job a listed tool now does: click, type_text, press_key, move_cursor and
+    /// get_cursor_position. Two families with different contracts for one action cost callers a
+    /// failed call each time they mixed them, so only one is listed; the others still work.
+    static let unlistedToolNames: Set<String> = ["left_click", "right_click", "type", "key", "mouse_move", "cursor_position"]
+
+    public static var advertisedToolNames: [String] {
+        callableToolNames.filter { !unlistedToolNames.contains($0) }
     }
 
     private let queue: ComputerUseHostQueue
@@ -245,7 +267,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Read the installed mac-use skill before using these tools (repository: skills/mac-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Call cua_status first: when cua Spaces are available, prefer a Space (through the cua MCP server) for work that does not need the user's own apps, windows, files or signed-in sessions. mac-use controls exact macOS windows without implicit activation. Use restore_window only when explicitly requested, then use its fresh state token. Pointer fallback tools use screenshot coordinates and require the exact window already focused, not merely another window of the same foreground app; key accepts an allowlisted key only while the exact window is already focused. Prefer jev_decide / run_subtask / verify_state criteria (Jev, text-only, cheap) before screenshots; screenshots only when Jev returns NEEDS_AGENT/BLOCKED or the surface has no AX/DOM labels. List windows for native work, then use jev_decide for one semantic step: it uses Jev with JEV_API_KEY, TYPESAFE_API_KEY or OPENROUTER_API_KEY; without any key it returns safe candidates for the session LLM to decide. With Jev, the reply also lists runner-up alternatives, complete/consequential/authorized signals and a reason when BLOCKED, so the session LLM can verify the advice or ask the user; alternatives are evidence, never authorization. Neither mode posts input. Call click_element with the exact role, label, target and state token only when authorized; set_value sets a field/slider/checkbox/pop-up by role and label, and menu_shortcut presses the enabled menu item bound to a chord (MOD+S), both without focusing the window. Minimized windows and hidden apps allow get_ui_tree, click_element and set_value; input-event tools need restore_window first. Reobserve after every mutation. Chrome background tabs use browser_status, browser_open, browser_snapshot, browser_act and browser_close with the separately installed extension; close each owned tab as soon as its purpose is complete, including after an error. The extension best-effort closes tabs it created that remain inactive and were not selected by the user; Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Selecting an automated tab yields control to the user. Native mutation yields to human activity and fails closed when safe background actions are unavailable. Jev receives filtered goal text and eligible Accessibility labels, never screenshots or field values; labels and goals may still contain private information. For a multi-step goal with a Jev key, run_subtask runs a bounded observe-decide-act loop over your inputs, verification and constraints and returns SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; secret_inputs are typed but never shown to Jev or returned.",
+                "instructions": Self.instructions,
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -253,8 +275,16 @@ public struct ManagedComputerUseMCP: Sendable {
             let params = message["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
             let arguments = params?["arguments"] as? [String: Any] ?? [:]
-            guard Self.advertisedToolNames.contains(name) else {
+            guard Self.callableToolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
+            }
+            if let refusal = Self.unknownArgument(name: name, arguments: arguments) {
+                let result = ComputerUseToolResult(text: refusal, isError: true)
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": true])
+            }
+            if name == "run_steps" {
+                let result = await runSteps(arguments)
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
             }
             if Self.sessionTools.contains(name) {
                 let result = await sessions.invoke(name: name, arguments: arguments)
@@ -392,8 +422,16 @@ public struct ManagedComputerUseMCP: Sendable {
                 }
             }
             do {
-                let result = try await queue.withExclusive(kind: kind, targetPID: targetPID) {
+                var result = try await queue.withExclusive(kind: kind, targetPID: targetPID) {
                     await recorded(name, arguments) { await backend.invoke(name: name, arguments: arguments) }
+                }
+                // Callers read rows; the tools inside this server that parse the tree ask the backend directly.
+                if name == "get_ui_tree", !result.isError, arguments["format"] as? String != "json", let text = result.content.first?.text {
+                    let limit = (arguments["max_elements"] as? NSNumber)?.intValue ?? UITreeRows.defaultMaxElements
+                    result.content[0] = .text(UITreeRows.rewrite(result: text, maxElements: limit, query: arguments["query"] as? String))
+                }
+                if ["get_ui_tree", "screenshot", "doctor"].contains(name), let hint = Self.browserToolsHint(pid: targetPID) {
+                    result.content.append(.text(hint))
                 }
                 return reply(id: id, result: [
                     "content": result.jsonContent(),
@@ -407,6 +445,44 @@ public struct ManagedComputerUseMCP: Sendable {
         default:
             return errorReply(id: id, code: -32601, message: "method not found: \(method)")
         }
+    }
+
+    /// An argument that is dropped in silence looks like it was honored (a screenshot `width` was).
+    static func unknownArgument(name: String, arguments: [String: Any]) -> String? {
+        guard let properties = inputSchema(for: name)["properties"] as? [String: Any] else { return nil }
+        guard let unknown = arguments.keys.sorted().first(where: { properties[$0] == nil && $0 != "session" }) else { return nil }
+        return "unknown argument: \(unknown); accepted: \(properties.keys.sorted().joined(separator: ", "))"
+    }
+
+    static let maximumSteps = 32
+
+    /// Several calls in one round trip, stopping at the first that fails, with one read at the end.
+    /// Each step goes through tools/call, so it gets the same queue, guards and recording.
+    private func runSteps(_ arguments: [String: Any]) async -> ComputerUseToolResult {
+        guard let steps = arguments["steps"] as? [[String: Any]], !steps.isEmpty, steps.count <= Self.maximumSteps else {
+            return ComputerUseToolResult(text: "steps must be 1 to \(Self.maximumSteps) objects of {tool, arguments}", isError: true)
+        }
+        var results: [[String: Any]] = []
+        var failed: Int?
+        for (index, step) in steps.enumerated() {
+            guard let tool = step["tool"] as? String, Self.callableToolNames.contains(tool),
+                  !["run_steps", "run_subtask", "replay_trajectory"].contains(tool) else {
+                results.append(["tool": step["tool"] as? String ?? "", "ok": false, "text": "not a tool that can run as a step"])
+                failed = index
+                break
+            }
+            let result = await replayCall(name: tool, arguments: step["arguments"] as? [String: Any] ?? [:])
+            let text = result.content.compactMap(\.text).joined(separator: "\n")
+            results.append(["tool": tool, "ok": !result.isError, "text": String(text.prefix(1200))])
+            if result.isError { failed = index; break }
+        }
+        var output: [String: Any] = ["completed": failed ?? steps.count, "total": steps.count, "results": results]
+        if let failed { output["failed_step"] = failed }
+        if let observe = arguments["observe"] as? [String: Any] {
+            let read = await replayCall(name: "get_ui_tree", arguments: observe.merging(["ocr": "never"]) { current, _ in current })
+            output["observation"] = read.content.compactMap(\.text).joined(separator: "\n")
+        }
+        return ComputerUseToolResult(text: encode(output) ?? "{}", isError: failed != nil)
     }
 
     public static func toolCatalog() -> [[String: Any]] {
@@ -427,7 +503,7 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func description(for name: String) -> String {
         switch name {
         case screenshotTool:
-            return "Capture the exact target window; returned image coordinates are pixels with a top-left origin."
+            return "Capture the exact target window, scaled to max_image_dimension on its long edge. The result states image_size; click coordinates are pixels of that image, top-left origin."
         case "zoom":
             return "Return an exact integral pixel crop from the target window; crop coordinates and returned image coordinates use a top-left origin."
         case leftClickTool:
@@ -447,7 +523,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "list_windows":
             return "List on-screen windows, optionally filtered by bundle id."
         case "get_ui_tree":
-            return "Accessibility tree for a window; each actionable element has an ax_<n> id for click_element and set_value. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line of recognized text after the tree. Contains private screen text; use jev_decide for redacted Jev guidance."
+            return "Accessibility tree for a window, one row per element: - [ax_<n>] role \"title\" (description) = \"value\". Use the ax_<n> id with click_element, set_value, click or type_text; it keeps meaning the element you read even if the window changes. Returns max_elements rows (default \(UITreeRows.defaultMaxElements)); pass query to read only what you need. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line. Contains private screen text; use jev_decide for redacted Jev guidance."
         case "jev_decide":
             return "Prefer this text-only, cheap Jev step before screenshots. browser:true observes the owned Chrome tab without target_pid/window and proposes browser_act click only, with ref and state_token; never fill. Native mode needs target_pid and target_window_id. With a Jev key, ask Jev for one semantic action, WAIT, DONE, NEEDS_AGENT or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
         case "run_subtask":
@@ -461,17 +537,19 @@ public struct ManagedComputerUseMCP: Sendable {
         case "restore_window":
             return "Explicitly restore and focus the exact PID/window; requires its fresh state token and returns a new observation. Use that new token for subsequent actions."
         case "browser_open":
-            return "Open an HTTP(S) URL in a new background tab in the connected Chrome profile. Always call browser_close on this same connection when finished or on error, before another open. Never navigate a tab selected by the user."
+            return "Open an HTTP(S) URL in a new background tab in the connected Chrome profile, kept rendering while it stays in the background (Chrome shows its debugging bar until browser_close). Always call browser_close on this same connection when finished or on error, before another open."
         case "browser_snapshot":
-            return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text."
+            return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text. Pass query to get only the controls you need."
         case "browser_act":
-            return "Click, fill, type or scroll in the owned background tab using a fresh snapshot ref. Fails if the user selects the tab; confirm consequential actions."
+            return "Click, fill, type or scroll in the owned background tab using a fresh snapshot ref. Yields with human_activity if the user selects the tab; confirm consequential actions."
         case "browser_close":
             return "Release the session and best-effort close its tab if it remains inactive and has not been selected by the user. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Chrome cannot make this activity check and removal atomic, so a selection racing with removal may still be closed."
         case "browser_status":
-            return "Check whether the separate Chrome extension is connected."
+            return "Report whether the Chrome extension is installed, connected and current: state is connected, busy, outdated, not_connected or not_installed, with a hint for the last four. Never fails; answers within 2 seconds."
         case "doctor":
             return "Permission and native-backend diagnostics."
+        case "run_steps":
+            return "Run up to \(maximumSteps) tool calls in order in one round trip, stopping at the first that fails, then optionally read the window once (observe: the arguments of get_ui_tree). Use it to act and re-read together: steps:[{tool, arguments}]. Step results are text; a step cannot be run_steps, run_subtask or replay_trajectory."
         case "cua_status":
             return "Read-only: report whether the cua CLI is installed and which cua Spaces are registered. When available, prefer a Space via the cua MCP server for tasks that do not need the user's real apps or sessions."
         default:
@@ -481,12 +559,15 @@ public struct ManagedComputerUseMCP: Sendable {
     }
 
     private static func inputSchema(for name: String) -> [String: Any] {
-        let targeting: [String: Any] = [
+        var targeting: [String: Any] = [
             "target_app": ["type": "string"],
             "target_pid": ["type": "integer"],
             "target_window_id": ["type": "integer"],
             "expected_state_token": ["type": "string"],
         ]
+        if mutationTools.contains(name) {
+            targeting["allow_while_user_active"] = ChromeProfileComputerUseBackend.allowWhileUserActive
+        }
         if let schema = DesktopToolsBackend.inputSchema(for: name) ?? InputToolsBackend.inputSchema(for: name)
             ?? SessionToolsBackend.inputSchema(for: name) ?? ChromeProfileComputerUseBackend.inputSchema(for: name) {
             return schema
@@ -499,13 +580,21 @@ public struct ManagedComputerUseMCP: Sendable {
                 "action": ["type": "string", "enum": ["click", "fill", "type", "scroll"]],
                 "ref": ["type": "string"], "text": ["type": "string"],
                 "delta_x": ["type": "number"], "delta_y": ["type": "number"],
+                "allow_while_user_active": ChromeProfileComputerUseBackend.allowWhileUserActive,
             ], "required": ["action"]]
-        case "browser_snapshot", "browser_close", "browser_status", "cua_status":
+        case "browser_snapshot":
+            return ["type": "object", "properties": [
+                "allow_while_user_active": ChromeProfileComputerUseBackend.allowWhileUserActive,
+                "query": ["type": "string", "description": "Case-insensitive substring of an element's role, name or value; a|b for alternatives. Returns only matching elements and leaves the page text out."],
+            ]]
+        case "browser_close", "browser_status", "cua_status":
             return ["type": "object", "properties": [String: Any]()]
         case screenshotTool:
             return [
                 "type": "object",
-                "properties": targeting,
+                "properties": targeting.merging([
+                    "max_image_dimension": ["type": "integer", "minimum": 0, "description": "Long-edge limit in pixels for the returned image; default \(ComputerUseNativeHostBackend.defaultMaxImageDimension) unless configured, 0 for the native frame."],
+                ]) { _, new in new },
                 "required": ["target_pid", "target_window_id"],
             ]
         case "zoom":
@@ -597,7 +686,18 @@ public struct ManagedComputerUseMCP: Sendable {
         case "list_windows":
             return [
                 "type": "object",
-                "properties": ["bundle_id": ["type": "string"]],
+                "properties": ["bundle_id": ["type": "string"], "target_app": ["type": "string"]],
+            ]
+        case "run_steps":
+            return [
+                "type": "object",
+                "properties": [
+                    "steps": ["type": "array", "minItems": 1, "maxItems": maximumSteps, "items": [
+                        "type": "object", "properties": ["tool": ["type": "string"], "arguments": ["type": "object"]], "required": ["tool"],
+                    ]],
+                    "observe": ["type": "object", "description": "Arguments for one get_ui_tree read after the steps: target_pid, target_window_id, and optionally query and max_elements."],
+                ],
+                "required": ["steps"],
             ]
         case "jev_decide":
             return [
@@ -638,6 +738,9 @@ public struct ManagedComputerUseMCP: Sendable {
                 "type": "object",
                 "properties": targeting.merging([
                     "ocr": ["type": "string", "enum": ["auto", "always", "never"]],
+                    "query": ["type": "string", "description": "Case-insensitive substring of a role, title, description, value or identifier; a|b for alternatives. Keeps matching rows and their ancestors."],
+                    "max_elements": ["type": "integer", "minimum": 1, "maximum": UITreeRows.maximumElements, "default": UITreeRows.defaultMaxElements],
+                    "format": ["type": "string", "enum": ["rows", "json"], "default": "rows"],
                 ]) { _, new in new },
                 "required": ["target_pid", "target_window_id"],
             ]
@@ -654,6 +757,14 @@ public struct ManagedComputerUseMCP: Sendable {
                 "required": ["target_pid", "target_window_id"],
             ]
         }
+    }
+
+    /// A page answers DOM refs in a background tab far better than clicks in the Chrome window,
+    /// so say so when the caller looks at Chrome and the extension is there to use.
+    static func browserToolsHint(pid: Int32?, bundleID: (Int32) -> String? = { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier },
+                                 extensionConnected: () -> Bool = { ChromeProfileConnection.hostListening() }) -> String? {
+        guard let pid, bundleID(pid) == "com.google.Chrome", extensionConnected() else { return nil }
+        return "hint: the mac-use Chrome extension is connected. For web pages use browser_open and the browser_* tools (own background tab, DOM refs); use this window only for Chrome's own controls."
     }
 
     private static func targetPID(from arguments: [String: Any]) -> Int32? {
