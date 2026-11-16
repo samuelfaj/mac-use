@@ -31,6 +31,7 @@ struct MacUseServer {
                     FileHandle.standardOutput.write(Data((response + "\n").utf8))
                 }
             }
+            await handler.closeBrowser()
             exit(0)
         }
         // Keep the main thread available for lazy AppKit overlays.

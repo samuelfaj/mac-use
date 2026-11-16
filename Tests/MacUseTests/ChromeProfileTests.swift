@@ -140,6 +140,23 @@ final class ChromeProfileTests: XCTestCase {
         XCTAssertNil(ManagedComputerUseMCP.browserToolsHint(pid: nil, bundleID: chrome, extensionConnected: { true }))
     }
 
+    func testATabLeftOpenIsClosedWhenTheClientGoesAway() async {
+        // The tab is kept awake by an attached debugger, so one that outlives its agent leaves
+        // Chrome's debugging bar on screen until someone finds and closes it.
+        final class Calls: @unchecked Sendable { var operations: [String] = [] }
+        let calls = Calls()
+        let backend = ChromeProfileComputerUseBackend(send: { request in
+            calls.operations.append(request["operation"] as? String ?? "")
+            return ["ok": true, "closed": true, "released": true]
+        })
+        let handler = ManagedComputerUseMCP(browser: backend)
+        await handler.closeBrowser(extensionConnected: { true })
+        XCTAssertEqual(calls.operations, ["browser_close"])
+        // With no extension connected there is nothing to close and nothing to wait for.
+        await handler.closeBrowser(extensionConnected: { false })
+        XCTAssertEqual(calls.operations, ["browser_close"])
+    }
+
     func testEveryBrowserToolThatActsOnThePageAcceptsTheEscalationFlag() throws {
         // A schema with additionalProperties:false that omits the flag would make the client
         // reject the retry the human_activity error asks for.

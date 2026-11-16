@@ -203,6 +203,13 @@ public struct ManagedComputerUseMCP: Sendable {
         }
     }
 
+    /// Called when the client goes away. An agent that never reached browser_close would leave
+    /// its tab open with Chrome's debugging bar showing; nothing else is listening to close it.
+    public func closeBrowser(extensionConnected: () -> Bool = { ChromeProfileConnection.hostListening() }) async {
+        guard extensionConnected() else { return }
+        _ = await browser.invoke(name: "browser_close", arguments: [:])
+    }
+
     /// Re-enters tools/call so replayed turns take the same queue, guards and recording.
     private func replayCall(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
         let request: [String: Any] = ["jsonrpc": "2.0", "id": 1, "method": "tools/call",
