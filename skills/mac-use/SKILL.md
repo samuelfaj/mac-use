@@ -25,11 +25,13 @@ Do the work without disturbing the user whenever a route for it exists, and do n
 
 Escalation is about focus and timing only. A consequential action still needs the user's authorization.
 
-## Jev-first decisions and verification
+## Decision-model-first decisions and verification
 
-1. Start with structured text: native window metadata/Accessibility labels where supported, or `browser_snapshot` for the owned tab. Use filtered labels, roles and goal text; never send screenshots, field values or secrets to Jev.
-2. Prefer `jev_decide` for the next authorized step; use `browser: true` for the owned Chrome tab. Use `run_subtask` with a Jev key for bounded native multi-step goals. Jev is faster and cheaper than screenshot reasoning, not a substitute for user authorization. Without a key, use returned local candidates/evidence; do not invent a Jev result or silently ignore a configured Jev error.
-3. Verify results with `verify_state` and natural-language `expect.criteria`, evaluated by Jev over filtered text. Treat `fail` or `unknown` as unverified, not completion. Use screenshots only when structured text is unavailable or insufficient; never send those fallback images to Jev.
+With `OPENROUTER_API_KEY`, `jev_decide`, `verify_state` criteria and `run_subtask` are answered by `liquid/d1.2-ultra`; Jev (`typesafe/jev-1.14`) answers only when d1.2-ultra is unreachable. `engine` names the model that answered and `fallback_reason` marks a fallback; treat a fallback answer as less calibrated. A Jev key without OpenRouter calls Jev directly.
+
+1. Start with structured evidence: native window metadata/Accessibility labels where supported, or `browser_snapshot` for the owned tab. Filtered labels, roles and goal text go to the model, never field values or secrets as text. Native `jev_decide` and `verify_state` also send a screenshot of the exact window (1024 px), which shows field contents, unless it has a secure text field; check `image_attached` and `image_skip_reason`. Do not call these tools on a window whose pixels the user would not want sent to OpenRouter.
+2. Prefer `jev_decide` for the next authorized step; use `browser: true` for the owned Chrome tab (labels only). Use `run_subtask` for bounded native multi-step goals. The model is faster and cheaper than screenshot reasoning by the session LLM, not a substitute for user authorization. Without a key, use returned local candidates/evidence; do not invent a model result or silently ignore a configured model error.
+3. Verify results with `verify_state` and natural-language `expect.criteria`. Treat `fail` or `unknown` as unverified, not completion. Read screenshots yourself only when the model's answer is unavailable or insufficient.
 
 ## Sessions, recordings and temporary state
 
@@ -81,13 +83,13 @@ More on acting:
 - An unknown argument is refused with the list of accepted ones; nothing is dropped in silence. The earlier `left_click`, `right_click`, `type`, `key`, `mouse_move` and `cursor_position` still run but are no longer listed: `click`, `type_text`, `press_key`, `move_cursor` and `get_cursor_position` do their jobs.
 - Close a task-created native window through its freshly observed close control, or a supported exact-window close action. There is no generic native `close_window` MCP tool. Do not quit an application that also contains the user's windows, discard the user's unsaved work, or use blind global shortcuts.
 
-## Jev and bounded subtasks
+## Decision model and bounded subtasks
 
-- Prefer Accessibility actions on the observed element. `jev_decide` offers advice or local candidates; it neither authorizes nor executes an action. Without Jev (`mode: llm`), choose from `candidates` using the user's goal.
-- With Jev (`mode: jev`), check its choice against the goal, `alternatives` and `signals`. On `BLOCKED`, read `reason`: ask the user when a material action lacks authorization, otherwise observe again or pick a listed candidate only when the goal makes it unambiguous. A high `consequential` signal needs explicit user authorization no matter what Jev chose.
+- Prefer Accessibility actions on the observed element. `jev_decide` offers advice or local candidates; it neither authorizes nor executes an action. Without a key (`mode: llm`), choose from `candidates` using the user's goal.
+- With a key (`mode: jev`, whichever `engine` answered), check its choice against the goal, `alternatives` and `signals`. On `BLOCKED`, read `reason`: ask the user when a material action lacks authorization, otherwise observe again or pick a listed candidate only when the goal makes it unambiguous. A high `consequential` signal needs explicit user authorization no matter what the model chose.
 - `get_ui_tree` takes `ocr: auto|always|never`; OCR text follows the tree on an `ocr:` line and needs Screen Recording. `jev_decide` always reads without OCR.
 - `jev_decide` accepts `allowed_risks` (`delete`, `send`, `purchase`, `close`), `min_confidence` and `min_margin`. Pass `allowed_risks` only for categories the user's goal explicitly authorizes; other risky controls are withheld.
-- `run_subtask` (needs a Jev key) runs a bounded observe-decide-act loop. Fields: `goal`, `verification` (non-empty), `constraints`, `inputs`, `max_actions` (default 30), `shortcuts`, `allowed_risks`, `secret_inputs` (typed but never shown to Jev or returned), `dry_run`, `min_confidence`, `min_margin`. Statuses: `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT` (supply the missing input), `NEEDS_AGENT` (take over, e.g. a risky control), `DRY_RUN`. Verify the result yourself before reporting completion.
+- `run_subtask` (needs `OPENROUTER_API_KEY` or a Jev key; labels, values and OCR only, no screenshot) runs a bounded observe-decide-act loop. Fields: `goal`, `verification` (non-empty), `constraints`, `inputs`, `max_actions` (default 30), `shortcuts`, `allowed_risks`, `secret_inputs` (typed but never shown to the model or returned), `dry_run`, `min_confidence`, `min_margin`. Statuses: `SUBTASK_COMPLETE`, `BLOCKED`, `NEEDS_INPUT` (supply the missing input), `NEEDS_AGENT` (take over, e.g. a risky control), `DRY_RUN`. Verify the result yourself before reporting completion.
 - Chrome: `browser_act` waits for the page to settle and returns a fresh snapshot, so earlier `ref`s are stale. `browser_snapshot` takes `query` to return only matching controls. Select options and fill are supported, covered elements are refused, and live-region changes are reported.
 
 ## Other resources and final cleanup

@@ -69,7 +69,10 @@ final class JevExtensionsTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(result.content.first?.text).utf8)) as? [String: Any])
     }
 
-    private func backend(_ transport: any JevTransport, available: Bool) -> InputToolsBackend {
+    private func backend(
+        _ transport: any JevTransport, available: Bool,
+        capture: @escaping @Sendable (ComputerUseNativeHostTarget) async -> (url: String?, skipReason: String?) = { _ in (nil, "no capture in tests") }
+    ) -> InputToolsBackend {
         var effects = InputToolsBackend.Effects()
         effects.windows = { [] }
         effects.snapshot = { _ in InputSnapshot(windowExists: true,
@@ -78,6 +81,7 @@ final class JevExtensionsTests: XCTestCase {
                     InputNode(role: "AXTextField", label: "Password: hunter2", value: "hunter2"),
                     InputNode(role: "AXButton", label: "Send"),
                     InputNode(role: "AXButton", label: "https://private.example")], focused: nil) }
+        effects.capture = capture
         return InputToolsBackend(effects: effects, transport: transport, jevAvailable: { available })
     }
 
@@ -104,6 +108,44 @@ final class JevExtensionsTests: XCTestCase {
         }
         XCTAssertTrue(payload.contains("Saved"))
         XCTAssertFalse(payload.contains("\"value\""))
+    }
+
+    func testCriteriaAreCheckedOnceWithTheWindowImage() async throws {
+        let transport = ExtensionsJev()
+        let result = try object(await backend(transport, available: true, capture: { target in
+            XCTAssertEqual(target, ComputerUseNativeHostTarget(pid: 42, windowID: 7))
+            return ("data:image/png;base64,QUJD", nil)
+        }).invoke(name: "verify_state", arguments: ["target_pid": 42, "target_window_id": 7, "expect": ["criteria": criteria]]))
+        let requests = await transport.captured()
+        XCTAssertEqual(requests.count, 1)
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual((request["questions"] as? [String: Any])?.count, 3)
+        let parts = try XCTUnwrap(request["state"] as? [Any])
+        XCTAssertEqual(((parts[0] as? [String: Any])?["image_url"] as? [String: String])?["url"], "data:image/png;base64,QUJD")
+        // The labels still travel filtered beside the image.
+        let payload = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+        XCTAssertTrue(payload.contains("Saved"))
+        XCTAssertFalse(payload.contains("hunter2"))
+        let checks = try XCTUnwrap(result["checks"] as? [[String: Any]])
+        XCTAssertEqual(checks.map { $0["image_attached"] as? Bool }, [true, true, true])
+        XCTAssertEqual(checks.compactMap { $0["result"] as? String }, ["pass", "fail", "unknown"])
+    }
+
+    func testSecureFieldKeepsVerificationTextOnly() async throws {
+        var effects = InputToolsBackend.Effects()
+        effects.windows = { [] }
+        effects.snapshot = { _ in InputSnapshot(windowExists: true, title: "Sign in",
+            nodes: [InputNode(role: "AXSecureTextField", label: "Password", value: "hunter2")], focused: nil) }
+        effects.capture = { _ in XCTFail("A window with a secure field must not be captured"); return (nil, nil) }
+        let transport = ExtensionsJev(probabilities: [0.5])
+        let result = try object(await InputToolsBackend(effects: effects, transport: transport, jevAvailable: { true })
+            .invoke(name: "verify_state", arguments: ["target_pid": 42, "target_window_id": 7, "expect": ["criteria": ["Signed in"]]]))
+        let checks = try XCTUnwrap(result["checks"] as? [[String: Any]])
+        XCTAssertEqual(checks.first?["image_skip_reason"] as? String, "secure_field")
+        XCTAssertEqual(checks.first?["image_attached"] as? Bool, false)
+        let requests = await transport.captured()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertTrue(requests.first?["state"] is [String: Any])
     }
 
     func testCriteriaWithoutKeyReturnsEvidenceAndNeverCallsJev() async throws {

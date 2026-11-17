@@ -76,16 +76,22 @@ final class JevDecisionTests: XCTestCase {
 
     private var safeObservation: String { observation.replacingOccurrences(of: "\"Send\"", with: "\"Save\"") }
 
-    func testJevCredentialsSelectCorrectTypedProviderAndModel() throws {
+    func testOpenRouterKeyAlwaysRoutesToD12UltraWithJevFallback() throws {
         XCTAssertNil(TypeSafeJevTransport.route(environment: [:]))
         let openRouter = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key"]))
         XCTAssertEqual(openRouter.url.absoluteString, "https://openrouter.ai/api/alpha/decisions")
-        XCTAssertEqual(openRouter.model, "typesafe/jev-1.13")
+        XCTAssertEqual(openRouter.model, "liquid/d1.2-ultra")
+        XCTAssertEqual(openRouter.fallbackModel, "typesafe/jev-1.14")
         XCTAssertEqual(openRouter.key, "or-key")
-        let direct = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "ts-key"]))
+        // The owner chose OpenRouter for every decision, so a Jev key beside it must not win.
+        let both = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "ts-key"]))
+        XCTAssertEqual(both.model, "liquid/d1.2-ultra")
+        XCTAssertEqual(both.key, "or-key")
+        // Without OpenRouter, a Jev key keeps the direct TypeSafe route and has nothing to fall back to.
+        let direct = try XCTUnwrap(TypeSafeJevTransport.route(environment: ["TYPESAFE_API_KEY": "ts-key"]))
         XCTAssertEqual(direct.url.absoluteString, "https://api.typesafe.ai/v1/systemone")
         XCTAssertEqual(direct.model, "jev-latest")
-        XCTAssertEqual(direct.key, "ts-key")
+        XCTAssertNil(direct.fallbackModel)
         XCTAssertEqual(TypeSafeJevTransport.route(environment: ["JEV_API_KEY": "jev-key", "TYPESAFE_API_KEY": "ts-key"])?.key, "jev-key")
     }
 
@@ -110,7 +116,7 @@ final class JevDecisionTests: XCTestCase {
                 }
             }
             let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            XCTAssertEqual(body?["model"] as? String, "typesafe/jev-1.13")
+            XCTAssertEqual(body?["model"] as? String, "liquid/d1.2-ultra")
             XCTAssertEqual((body?["state"] as? [String: String])?["goal"], "Click Save")
             requested.fulfill()
         }

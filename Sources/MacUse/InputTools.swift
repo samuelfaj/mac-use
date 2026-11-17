@@ -251,6 +251,9 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         }
         var menu: (ComputerUseNativeHostTarget, [String], () throws -> Void) throws -> Void = InputProduction.menu
         var snapshot: (ComputerUseNativeHostTarget) -> InputSnapshot = InputProduction.snapshot
+        var capture: @Sendable (ComputerUseNativeHostTarget) async -> (url: String?, skipReason: String?) = { target in
+            await DecisionImage.capture(ComputerUseNativeHostBackend(), pid: target.pid, windowID: target.windowID)
+        }
     }
 
     private let effects: Effects
@@ -280,7 +283,7 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
         case "move_cursor": return "Window scope reports an overlay position only, without moving real pointer. Desktop scope warps real pointer in screen points."
         case "get_cursor_position": return "Return real cursor position in screen points."
         case "invoke_menu": return "Walk app AX menu titles one level at a time, refusing missing, ambiguous or disabled items; press final item without activation."
-        case "verify_state": return "Evaluate deterministic window checks plus expect.criteria (1-8 natural-language checks, at most 200 characters each). Prefer text-only, cheap Jev verification before screenshots: one Jev request over filtered AX labels/roles and scrubbed title, never field values. No key returns unknown with filtered evidence for the session LLM. Return pass, fail or unknown per check."
+        case "verify_state": return "Evaluate deterministic window checks plus expect.criteria (1-8 natural-language checks, at most 200 characters each). One cheap decision-model request (liquid/d1.2-ultra, Jev on fallback) over filtered AX labels/roles, the scrubbed title and the window screenshot (1024 px; none with a secure field), never field values as text. No key returns unknown with filtered evidence for the session LLM. Return pass, fail or unknown per check, with engine and image_attached."
         default: return nil
         }
     }
@@ -379,10 +382,20 @@ public final class InputToolsBackend: ComputerUseToolBackend, @unchecked Sendabl
                     guard let role = node.role, role != "AXSecureTextField", let label = node.label else { return nil }
                     return (role, label)
                 }
-                let checks: [[String: Any]]
+                var checks: [[String: Any]]
                 do {
+                    // A switch's state, a progress bar or an error banner is in the pixels, not the labels.
+                    var captured: (url: String?, skipReason: String?) = (nil, nil)
+                    if jevAvailable() {
+                        let secure = (snapshot.nodes ?? []).contains { $0.role == "AXSecureTextField" }
+                        captured = secure ? (nil, "secure_field") : await effects.capture(target)
+                    }
                     checks = try await jev.verify(criteria: criteria, title: snapshot.title, labels: labels,
-                                                  available: jevAvailable(), secrets: (snapshot.nodes ?? []).compactMap(\.value))
+                                                  available: jevAvailable(), secrets: (snapshot.nodes ?? []).compactMap(\.value),
+                                                  image: captured.url)
+                    if captured.url == nil, jevAvailable() {
+                        for index in checks.indices { checks[index]["image_skip_reason"] = captured.skipReason ?? "capture_unavailable" }
+                    }
                 } catch {
                     checks = criteria.map { ["criterion": $0, "result": "unknown", "reason": "Jev verification unavailable or invalid"] }
                 }

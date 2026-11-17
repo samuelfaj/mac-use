@@ -68,6 +68,8 @@ public struct SubtaskRunner: Sendable {
         let confidence: Double
         let margin: Double
         let operationProbabilities: [String: Double]
+        var engine: String? = nil
+        var fallbackReason: String? = nil
     }
 
     private enum Outcome {
@@ -154,6 +156,8 @@ public struct SubtaskRunner: Sendable {
                 if let changed { entry["state_changed"] = changed }
                 if let decision {
                     entry["choice"] = decision.operation
+                    if let engine = decision.engine { entry["engine"] = engine }
+                    if let reason = decision.fallbackReason { entry["fallback_reason"] = reason }
                     entry["confidence"] = decision.confidence
                     entry["margin"] = decision.margin
                     entry["operation_probabilities"] = decision.operationProbabilities
@@ -200,6 +204,8 @@ public struct SubtaskRunner: Sendable {
             var entry: [String: Any] = [
                 "step": step, "action": operation, "confidence": decision.confidence, "margin": decision.margin,
             ]
+            if let engine = decision.engine { entry["engine"] = engine }
+            if let reason = decision.fallbackReason { entry["fallback_reason"] = reason }
             if let id = decision.targetID { entry["target"] = id }
             if let element { entry["target_name"] = element.name }
             if let key = decision.inputKey { entry["input_key"] = key }
@@ -398,21 +404,27 @@ public struct SubtaskRunner: Sendable {
                 "type": "noul", "instructions": "Does the chosen action respect every constraint?",
             ] as [String: Any],
         ]
+        // A choice needs two options on d1.2-ultra; NONE also lets the model reject the only candidate.
+        func withNone(_ criteria: [String: String]) -> [String: String] {
+            criteria.count == 1 ? criteria.merging(["NONE": "None of these fits"]) { old, _ in old } : criteria
+        }
+        let targetChoices = targetIDs.count == 1 ? targetIDs + ["NONE"] : targetIDs
+        let inputChoices = inputIDs.count == 1 ? inputIDs + ["NONE"] : inputIDs
         if !offered.isEmpty {
             questions["target"] = [
                 "type": "choice",
                 "instructions": "Which element does the chosen operation act on? Ignored for WAIT, DONE, BLOCKED and HOTKEY.",
-                "criteria": Dictionary(uniqueKeysWithValues: offered.map { ($0.id, "\($0.role) \"\(clip($0.name, 100))\"") }),
+                "criteria": withNone(Dictionary(uniqueKeysWithValues: offered.map { ($0.id, "\($0.role) \"\(clip($0.name, 100))\"") })),
             ] as [String: Any]
         }
         if setValueOffered {
             questions["input"] = [
                 "type": "choice",
                 "instructions": "Which provided input supplies the text for SET_VALUE? Literal text only comes from inputs.",
-                "criteria": Dictionary(uniqueKeysWithValues: zip(inputIDs, inputKeys).map { id, key -> (String, String) in
+                "criteria": withNone(Dictionary(uniqueKeysWithValues: zip(inputIDs, inputKeys).map { id, key -> (String, String) in
                     let secret = subtask.secretInputs.contains(key)
                     return (id, "Input \(id): \(secret ? SecretRedactor.placeholder : clip(subtask.inputs[key] ?? "", 200))")
-                }),
+                })),
             ] as [String: Any]
             questions["submit"] = [
                 "type": "choice",
@@ -468,7 +480,7 @@ public struct SubtaskRunner: Sendable {
                 return stop(.NEEDS_AGENT, "decision service error: " + clip(String(describing: error), 300))
             }
             parsed = Self.parse(
-                response, operations: operationNames, targets: targetIDs, inputs: setValueOffered ? inputIDs : [],
+                response, operations: operationNames, targets: targetChoices, inputs: setValueOffered ? inputChoices : [],
                 chords: chordNames, verifications: subtask.verification.count, inputKeys: keyByID)
             if parsed != nil { break }
         }
@@ -483,6 +495,12 @@ public struct SubtaskRunner: Sendable {
             return stop(.NEEDS_AGENT, why, decision)
         }
 
+        if decision.targetID == "NONE" {
+            return stop(.NEEDS_AGENT, "model chose none of the offered elements", decision)
+        }
+        if decision.operation == "SET_VALUE", decision.inputKey == nil {
+            return stop(.NEEDS_AGENT, "model chose none of the offered inputs", decision)
+        }
         switch decision.operation {
         case "BLOCKED":
             return stop(.BLOCKED, "model found no safe action toward the goal", decision)
@@ -551,8 +569,10 @@ public struct SubtaskRunner: Sendable {
             if operation.choice == "SET_VALUE" {
                 guard let input = head("input", inputs), let key = head("submit", ["NONE", "ENTER", "TAB"]) else { return nil }
                 used += [input, key]
-                guard let realKey = inputKeys[input.choice] else { return nil }
-                inputKey = realKey
+                if input.choice != "NONE" {
+                    guard let realKey = inputKeys[input.choice] else { return nil }
+                    inputKey = realKey
+                }
                 submit = key.choice
             }
         case "HOTKEY":
@@ -565,7 +585,8 @@ public struct SubtaskRunner: Sendable {
         let decision = Decision(
             operation: operation.choice, targetID: targetID, inputKey: inputKey, submit: submit, chord: chord,
             confidence: used.map(\.confidence).min() ?? 0, margin: used.map(\.margin).min() ?? 0,
-            operationProbabilities: operation.probabilities)
+            operationProbabilities: operation.probabilities, engine: response["engine"] as? String,
+            fallbackReason: response["fallback_reason"] as? String)
         return (decision, verify, constraint)
     }
 
