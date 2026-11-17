@@ -454,6 +454,48 @@ final class SubtaskRunnerTests: XCTestCase {
             "target_pid": 42, "target_window_id": 7, "goal": "x", "verification": ["v"],
         ])
         XCTAssertTrue(missing)
-        XCTAssertTrue(note.contains("run_subtask needs a Jev key"), note)
+        XCTAssertTrue(note.contains("run_subtask needs OPENROUTER_API_KEY or a Jev key"), note)
+    }
+
+    func testSingleCandidateGetsANoneOptionAndChoosingItStopsWithoutActing() async throws {
+        let backend = FakeBackend(trees: [observation(token: "t0", children: [button("ax_1", "Save")])])
+        let transport = FakeTransport { request, _ in answer(request, "CLICK", target: "NONE") }
+        let result = await runner(backend, transport).run(target: target, subtask: try subtask(), dryRun: false)
+        // d1.2-ultra rejects a one-option choice with HTTP 422, and NONE lets the model refuse the only control.
+        let questions = try XCTUnwrap(transport.requests.first?["questions"] as? [String: [String: Any]])
+        XCTAssertEqual((questions["target"]?["criteria"] as? [String: String])?.keys.sorted(), ["NONE", "ax_1"])
+        XCTAssertEqual(result["status"] as? String, "NEEDS_AGENT")
+        XCTAssertEqual(result["reason"] as? String, "model chose none of the offered elements")
+        XCTAssertTrue(backend.mutations.isEmpty)
+    }
+
+    func testSingleInputGetsANoneOptionAndChoosingItStopsWithoutTyping() async throws {
+        let backend = FakeBackend(trees: [observation(token: "t0", children: [field("ax_1", "Name"), button("ax_2", "Save")])])
+        let transport = FakeTransport { request, _ in answer(request, "SET_VALUE", target: "ax_1", input: "NONE") }
+        let result = await runner(backend, transport).run(
+            target: target, subtask: try subtask(["inputs": ["name": "Ana"]]), dryRun: false)
+        let questions = try XCTUnwrap(transport.requests.first?["questions"] as? [String: [String: Any]])
+        XCTAssertEqual((questions["input"]?["criteria"] as? [String: String])?.keys.sorted(), ["NONE", "input_0"])
+        XCTAssertEqual(result["status"] as? String, "NEEDS_AGENT")
+        XCTAssertEqual(result["reason"] as? String, "model chose none of the offered inputs")
+        XCTAssertTrue(backend.mutations.isEmpty)
+    }
+
+    func testHistoryNamesTheModelThatDecidedEachStep() async throws {
+        let backend = FakeBackend(trees: [
+            observation(token: "t0", children: [button("ax_1", "Save"), button("ax_2", "Cancel")]),
+            observation(token: "t1", children: [button("ax_1", "Save"), button("ax_2", "Cancel")]),
+        ])
+        let transport = FakeTransport { request, index in
+            var reply = index == 0 ? answer(request, "CLICK", target: "ax_1") : answer(request, "DONE")
+            reply["engine"] = "typesafe/jev-1.14"
+            reply["fallback_reason"] = "liquid/d1.2-ultra HTTP 503"
+            return reply
+        }
+        let result = await runner(backend, transport).run(target: target, subtask: try subtask(), dryRun: false)
+        XCTAssertEqual(result["status"] as? String, "SUBTASK_COMPLETE")
+        let history = try XCTUnwrap(result["history"] as? [[String: Any]])
+        XCTAssertEqual(history.first?["engine"] as? String, "typesafe/jev-1.14")
+        XCTAssertEqual(history.first?["fallback_reason"] as? String, "liquid/d1.2-ultra HTTP 503")
     }
 }

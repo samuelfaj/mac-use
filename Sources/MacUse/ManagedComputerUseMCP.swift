@@ -145,7 +145,7 @@ public struct ManagedComputerUseMCP: Sendable {
         "4. Read the result. effect is ui_changed when the app was seen to react, otherwise unverified; ok alone only means the input was accepted. On unverified, read the window again before repeating anything, above all a toggle. run_steps acts and reads in one call.",
         "5. Stay out of the user's way first: background tabs, Accessibility actions and background delivery never take focus, and a mutation yields with human_activity while the user is on the target. When no quiet route can do the work, retry with allow_while_user_active: true (and delivery_mode foreground or restore_window where needed) instead of stopping, then say what you interrupted. Never escalate when the user said not to interrupt them.",
         "6. Close what you opened (tabs, sessions, recordings) on success and on failure, and report cleanup you could not verify. Keep what the user took over.",
-        "With a Jev key, jev_decide, verify_state criteria and run_subtask give cheap text-only decisions; Jev never authorizes an action and never sees screenshots or field values. cua_status reports cua Spaces for work that does not need the user's own apps.",
+        "With OPENROUTER_API_KEY (or a Jev key), jev_decide, verify_state criteria and run_subtask give cheap typed decisions from liquid/d1.2-ultra, with Jev only as fallback; engine names the model that answered. Native jev_decide and verify_state also send the window screenshot unless it has a secure field. The screenshot shows what the window shows; field values are never sent as text, and the model never authorizes an action. cua_status reports cua Spaces for work that does not need the user's own apps.",
     ].joined(separator: "\n")
 
     public static var callableToolNames: [String] {
@@ -339,7 +339,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 }
                 guard jevAvailable() else {
                     let result = ComputerUseToolResult(
-                        text: "run_subtask needs a Jev key; use jev_decide for LLM-driven steps", isError: true)
+                        text: "run_subtask needs OPENROUTER_API_KEY or a Jev key; use jev_decide for LLM-driven steps", isError: true)
                     return reply(id: id, result: ["content": result.jsonContent(), "isError": true])
                 }
                 let output = await SubtaskRunner(backend: backend, transport: jevTransport, queue: queue).run(
@@ -408,9 +408,19 @@ public struct ManagedComputerUseMCP: Sendable {
                         proposal["state_token"] = snapshot["state_token"]
                         outputFromModel = proposal
                     } else if jevAvailable() {
+                        var image: JevDecision.ImageSource?
+                        if let pid = ComputerUseNativeHostBackend.exactInt32(arguments["target_pid"]),
+                           let window = ComputerUseNativeHostBackend.exactUInt32(arguments["target_window_id"]) {
+                            let backend = backend, queue = queue
+                            image = {
+                                (try? await queue.withExclusive(kind: .observation, targetPID: pid) {
+                                    await DecisionImage.capture(backend, pid: pid, windowID: window)
+                                }) ?? (nil, "capture_unavailable")
+                            }
+                        }
                         outputFromModel = try await jev.advise(
                             goal: goal, observation: text, allowedRisks: allowedRisks,
-                            minConfidence: minConfidence, minMargin: minMargin).jsonObject()
+                            minConfidence: minConfidence, minMargin: minMargin, image: image).jsonObject()
                     } else {
                         outputFromModel = try jev.localFallback(observation: text, allowedRisks: allowedRisks)
                     }
@@ -530,11 +540,11 @@ public struct ManagedComputerUseMCP: Sendable {
         case "list_windows":
             return "List on-screen windows, optionally filtered by bundle id."
         case "get_ui_tree":
-            return "Accessibility tree for a window, one row per element: - [ax_<n>] role \"title\" (description) = \"value\". Use the ax_<n> id with click_element, set_value, click or type_text; it keeps meaning the element you read even if the window changes. Returns max_elements rows (default \(UITreeRows.defaultMaxElements)); pass query to read only what you need. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line. Contains private screen text; use jev_decide for redacted Jev guidance."
+            return "Accessibility tree for a window, one row per element: - [ax_<n>] role \"title\" (description) = \"value\". Use the ax_<n> id with click_element, set_value, click or type_text; it keeps meaning the element you read even if the window changes. Returns max_elements rows (default \(UITreeRows.defaultMaxElements)); pass query to read only what you need. Optional ocr auto, always or never (needs Screen Recording) appends an \"ocr:\" line. Contains private screen text; use jev_decide for redacted decision-model guidance."
         case "jev_decide":
-            return "Prefer this text-only, cheap Jev step before screenshots. browser:true observes the owned Chrome tab without target_pid/window and proposes browser_act click only, with ref and state_token; never fill. Native mode needs target_pid and target_window_id. With a Jev key, ask Jev for one semantic action, WAIT, DONE, NEEDS_AGENT or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no Jev call. Neither path posts input. The returned token is checked again before native mutation; labels and goal text may contain private information."
+            return "Prefer this cheap decision-model step over reading screenshots yourself. browser:true observes the owned Chrome tab without target_pid/window, sends labels only and proposes browser_act click only, with ref and state_token; never fill. Native mode needs target_pid and target_window_id and sends filtered labels plus the window screenshot (1024 px; none with a secure field; see image_attached). With a key, ask liquid/d1.2-ultra (Jev on fallback; see engine and fallback_reason) for one semantic action, WAIT, DONE, NEEDS_AGENT or BLOCKED, plus runner-up alternatives, risk signals and a BLOCKED reason for the session LLM to weigh. Without a key, return unambiguous labeled candidates for the session LLM to decide; no model call. Neither path posts input. The returned token is checked again before native mutation; labels, goal text and screenshots may contain private information."
         case "run_subtask":
-            return "Requires a Jev key. Run a bounded loop (max_actions) that observes the window, asks Jev for one semantic step (CLICK, SET_VALUE, HOTKEY, WAIT, DONE, BLOCKED or NEEDS_INPUT), executes it natively and reobserves. Literal text comes only from inputs; secret_inputs are typed but never sent to Jev or returned. Risky controls (delete, send, purchase, close) are withheld unless in allowed_risks. Stops with SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; stops on human activity."
+            return "Requires OPENROUTER_API_KEY or a Jev key. Run a bounded loop (max_actions) that observes the window, asks the decision model (liquid/d1.2-ultra, Jev on fallback; no screenshot) for one semantic step (CLICK, SET_VALUE, HOTKEY, WAIT, DONE, BLOCKED or NEEDS_INPUT), executes it natively and reobserves. Literal text comes only from inputs; secret_inputs are typed but never sent to the model or returned. Risky controls (delete, send, purchase, close) are withheld unless in allowed_risks. Stops with SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN; stops on human activity."
         case "click_element":
             return "Press an AX element in the exact background target, by element_id (ax_<n> from the get_ui_tree of the observation whose token is passed) or by role and label."
         case "set_value":
@@ -711,9 +721,9 @@ public struct ManagedComputerUseMCP: Sendable {
                 "type": "object",
                 "properties": targeting.merging([
                     "browser": ["type": "boolean", "default": false, "description": "Use the owned Chrome tab DOM snapshot; native target not needed. Proposals click only."],
-                    "goal": ["type": "string", "description": "Original user goal; sanitized before sending to Jev."],
+                    "goal": ["type": "string", "description": "Original user goal; sanitized before sending to the decision model."],
                     "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]], "description": "Risk categories of controls the goal explicitly authorizes; other risky controls are withheld."],
-                    "min_confidence": ["type": "number", "description": "0-1; below this Jev's answer returns NEEDS_AGENT."],
+                    "min_confidence": ["type": "number", "description": "0-1; below this the model's answer returns NEEDS_AGENT."],
                     "min_margin": ["type": "number", "description": "0-1; minimum lead over the runner-up choice."],
                 ]) { _, new in new },
                 "required": ["goal"],
@@ -732,7 +742,7 @@ public struct ManagedComputerUseMCP: Sendable {
                     "max_actions": ["type": "integer", "minimum": 1, "description": "Action budget; default 30."],
                     "shortcuts": ["type": "object", "description": "Extra chords such as {\"MOD+S\": \"Save the document\"} mapped to a description.", "additionalProperties": ["type": "string"]],
                     "allowed_risks": ["type": "array", "items": ["type": "string", "enum": ["delete", "send", "purchase", "close"]]],
-                    "secret_inputs": ["type": "array", "items": ["type": "string"], "description": "Keys of inputs whose values are typed but redacted from Jev, results and logs."],
+                    "secret_inputs": ["type": "array", "items": ["type": "string"], "description": "Keys of inputs whose values are typed but redacted from the model, results and logs."],
                     "min_confidence": ["type": "number"],
                     "min_margin": ["type": "number"],
                     "dry_run": ["type": "boolean", "description": "Stop with DRY_RUN and planned_action after the first validated decision."],
